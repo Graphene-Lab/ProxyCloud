@@ -2029,8 +2029,93 @@
             let authentication = joinBuffers(auth, pin4);
             hash256(authentication).then(hash => {
                 let verify = hash.slice(0, 4);
-                executeRequest(command.Authentication, verify);
+                getZeroKnowledgeChecksum().then(zeroKnowledgeChecksum => {
+                    if (zeroKnowledgeChecksum) {
+                        executeRequest(command.Authentication, joinBuffers(verify, zeroKnowledgeChecksum));
+                    } else {
+                        executeRequest(command.Authentication, verify);
+                    }
+                });
             });
+        }
+
+        function getZeroKnowledgeChecksum() {
+            let enabled = document.getElementById("zkEnabled");
+            if (!enabled || enabled.checked !== true) {
+                return Promise.resolve(null);
+            }
+            let input = document.getElementById("zkpass");
+            if (!input || !input.value || input.value.trim() === "") {
+                return Promise.resolve(null);
+            }
+            return derivePrivateKeyFromPassphrase(input.value).then(masterKey => {
+                return hash256(masterKey).then(filenameObfuscationKey => {
+                    return hash256(filenameObfuscationKey).then(checksum => checksum.slice(0, 4));
+                });
+            });
+        }
+
+        function cleanPassphrase(passphrase) {
+            let cleaned = passphrase.replace(/\n/g, " ")
+                .replace(/\r/g, " ")
+                .replace(/,/g, "")
+                .replace(/!/g, "")
+                .replace(/\./g, "")
+                .trim();
+            cleaned = cleaned.replace(/\s+/g, " ");
+            return cleaned;
+        }
+
+        async function derivePrivateKeyFromPassphrase(passphrase) {
+            const encoder = new TextEncoder();
+            const cleaned = cleanPassphrase(passphrase);
+            const mnemonic = cleaned.normalize("NFKD");
+            const salt = "mnemonic".normalize("NFKD");
+
+            const keyMaterial = await crypto.subtle.importKey(
+                "raw",
+                encoder.encode(mnemonic),
+                "PBKDF2",
+                false,
+                ["deriveBits"]
+            );
+
+            const seed = await crypto.subtle.deriveBits(
+                {
+                    name: "PBKDF2",
+                    hash: "SHA-512",
+                    salt: encoder.encode(salt),
+                    iterations: 2048
+                },
+                keyMaterial,
+                512
+            );
+
+            const hmacKey = await crypto.subtle.importKey(
+                "raw",
+                encoder.encode("Bitcoin seed"),
+                { name: "HMAC", hash: "SHA-512" },
+                false,
+                ["sign"]
+            );
+
+            const i64 = await crypto.subtle.sign("HMAC", hmacKey, seed);
+            return i64.slice(0, 32);
+        }
+        
+        function onZeroKnowledgeToggle() {
+            let checkbox = document.getElementById("zkEnabled");
+            let container = document.getElementById("zkContainer");
+            let input = document.getElementById("zkpass");
+            if (!checkbox || !container || !input) {
+                return;
+            }
+            if (checkbox.checked) {
+                container.style.display = "block";
+            } else {
+                input.value = "";
+                container.style.display = "none";
+            }
         }
         function setClient(rsaPubKey) {
             session.deviceKey = null; // the server will send a new encryption key
@@ -3025,6 +3110,15 @@
                     <label for="pin">Pin</label>
                     <!--<input id="pin" type="password" value="">-->
                     <input id="pin" type="password" value="">
+                    <div>
+                        <input id="zkEnabled" type="checkbox" onchange="onZeroKnowledgeToggle()">
+                        <label for="zkEnabled">I enabled zero knowledge encryption while creating my account.</label>
+                    </div>
+                    <div id="zkContainer" style="display:none;">
+                        <label for="zkpass">Zero knowledge passphrase</label>
+                        <textarea id="zkpass" rows="3" style="width:100%;"></textarea>
+                    </div>
+                    <br />
                     <!--The server has protection against brute force attacks, it is not allowed to make attempts in less than 5 seconds, so you must disable the button this period or more-->
                     <button type="button" id="connect" onclick="this.disabled = true; setTimeout(() => this.disabled = false, 30000) // 30 sec. is the timeout on proxy site for answare;
                         ; onQrCodeAcquires(document.getElementById('qr').value);"
@@ -3038,6 +3132,7 @@
                             qr.value = queryQr;
                             qr.readOnly = true;
                         }
+                        onZeroKnowledgeToggle();
                     </script>
                 </fieldset>
                 <div class="info">

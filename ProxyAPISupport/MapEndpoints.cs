@@ -26,9 +26,7 @@ namespace ProxyAPISupport
             }
             else if (context.Request.Query.TryGetValue("qr", out var _))
             {
-                var browserUrl = "https://raw.githubusercontent.com/Andrea-Bruno/ProxyCloud/master/ClientHtml/CryptoCloudClientWeb.html";
-                var wc = new WebClient();
-                string html = wc.DownloadString(browserUrl);
+                string html = LoadClientHtml();
                 await context.Response.WriteAsync(html);
             }
             else
@@ -92,6 +90,40 @@ namespace ProxyAPISupport
         /// Path for logs: A remote machine can send logs to this proxy via http GET / log method, which will be saved in this directory
         /// </summary>
         public static string LogRepository { get; set; }
+
+        private static string LoadClientHtml()
+        {
+            // Prefer local file so proxy serves the same web client currently under development.
+            var baseDir = AppContext.BaseDirectory;
+            var localCandidates = new[]
+            {
+                Path.Combine(baseDir, "ClientHtml", "CryptoCloudClientWeb.html"),
+                Path.Combine(baseDir, "..", "ClientHtml", "CryptoCloudClientWeb.html"),
+                Path.Combine(baseDir, "..", "..", "ClientHtml", "CryptoCloudClientWeb.html"),
+                Path.Combine(baseDir, "..", "..", "..", "ClientHtml", "CryptoCloudClientWeb.html"),
+                Path.Combine(baseDir, "..", "..", "..", "..", "ClientHtml", "CryptoCloudClientWeb.html"),
+                Path.Combine(Directory.GetCurrentDirectory(), "ClientHtml", "CryptoCloudClientWeb.html"),
+            };
+
+            foreach (var candidate in localCandidates)
+            {
+                try
+                {
+                    var fullPath = Path.GetFullPath(candidate);
+                    if (File.Exists(fullPath))
+                        return File.ReadAllText(fullPath);
+                }
+                catch
+                {
+                    // Ignore and continue to next candidate.
+                }
+            }
+
+            // Fallback for behavior when local file is not available.
+            var browserUrl = "https://raw.githubusercontent.com/Andrea-Bruno/ProxyCloud/master/ClientHtml/CryptoCloudClientWeb.html";
+            using var wc = new WebClient();
+            return wc.DownloadString(browserUrl);
+        }
 
         /// <summary>
         /// End point for POST /data

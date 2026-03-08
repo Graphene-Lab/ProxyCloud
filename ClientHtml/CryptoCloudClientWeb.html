@@ -1047,7 +1047,7 @@
                 if (zkCheckbox) {
                     zkCheckbox.checked = false;
                 }
-                applyZeroKnowledgeRuntime("", false);
+                setZeroKnowledgePassphrase("");
                 await NewSession(id);
                 // Return to the initial login screen immediately after deleting the session.
                 window.location.reload();
@@ -1459,11 +1459,7 @@
             passphrase: null,
             state: null,
         };
-        let zkRuntime = {
-            initialized: false,
-            enabled: false,
-            passphrase: "",
-        };
+        let zkPassphrase = "";
 
         function zkLog() {
             let args = Array.from(arguments);
@@ -1476,32 +1472,46 @@
             zkCache.state = null;
         }
 
-        function applyZeroKnowledgeRuntime(passphrase, enabled) {
-            passphrase = typeof passphrase === "string" ? passphrase : "";
-            let normalizedPassphrase = passphrase.trim() !== "" ? passphrase : "";
-            let normalizedEnabled = enabled === true && normalizedPassphrase !== "";
-            let changed = !zkRuntime.initialized
-                || zkRuntime.enabled !== normalizedEnabled
-                || zkRuntime.passphrase !== normalizedPassphrase;
-            zkRuntime.initialized = true;
-            zkRuntime.enabled = normalizedEnabled;
-            zkRuntime.passphrase = normalizedPassphrase;
-            if (changed) {
-                clearZeroKnowledgeCache();
+        function setZeroKnowledgePassphrase(passphrase) {
+            let nextPassphrase = typeof passphrase === "string" && passphrase.trim() !== "" ? passphrase : "";
+            if (zkPassphrase === nextPassphrase) {
+                return;
             }
+            zkPassphrase = nextPassphrase;
+            clearZeroKnowledgeCache();
         }
 
-        function initZeroKnowledgeRuntimeFromStorage() {
-            let passphrase = readZkPassphraseFromStorage();
-            applyZeroKnowledgeRuntime(passphrase, true);
+        async function initializeZeroKnowledgeState() {
+            if (!shouldUseZeroKnowledge()) {
+                return;
+            }
+            let masterKey = toByteArray(await derivePrivateKeyFromPassphrase(zkPassphrase));
+            let filenameObfuscationKey = toByteArray(await hash256(masterKey));
+            let contentMaster = blake2b512(concatBytes([masterKey, filenameObfuscationKey]), 64);
+            zkCache.passphrase = zkPassphrase;
+            zkCache.state = {
+                masterKey: masterKey,
+                filenameObfuscationKey: filenameObfuscationKey,
+                contentMaster: contentMaster,
+            };
+            zkLog("Zero knowledge state created.", {
+                keyLen: masterKey.byteLength,
+                filenameKeyHash4: bufferToHex((await hash256(filenameObfuscationKey)).slice(0, 4)),
+            });
         }
 
-        function rebuildZeroKnowledgeRuntimeFromUi() {
+        async function initZeroKnowledgeRuntimeFromStorage() {
+            setZeroKnowledgePassphrase(readZkPassphraseFromStorage());
+            await initializeZeroKnowledgeState();
+        }
+
+        async function rebuildZeroKnowledgeRuntimeFromUi() {
             let checkbox = document.getElementById("zkEnabled");
             let input = document.getElementById("zkpass");
             if (!!checkbox && !!input) {
-                applyZeroKnowledgeRuntime(input.value || "", checkbox.checked === true);
+                setZeroKnowledgePassphrase(checkbox.checked === true ? (input.value || "") : "");
             }
+            await initializeZeroKnowledgeState();
         }
 
         function bytesPreviewHex(data, maxLen) {
@@ -1545,13 +1555,13 @@
         }
 
         function shouldUseZeroKnowledge() {
-            return zkRuntime.enabled === true && !!zkRuntime.passphrase && zkRuntime.passphrase.trim() !== "";
+            return !!zkPassphrase && zkPassphrase.trim() !== "";
         }
 
         function getZeroKnowledgeUiState() {
             let checkbox = document.getElementById("zkEnabled");
             let input = document.getElementById("zkpass");
-            let passphrase = zkRuntime.passphrase;
+            let passphrase = zkPassphrase;
             return {
                 hasCheckbox: !!checkbox,
                 enabled: shouldUseZeroKnowledge(),
@@ -1710,28 +1720,10 @@
             return output.buffer;
         }
 
-        async function getZeroKnowledgeState() {
-            if (!shouldUseZeroKnowledge()) {
+        function getZeroKnowledgeState() {
+            if (zkCache.state == null) {
                 zkLog("Zero knowledge disabled (passphrase missing).", getZeroKnowledgeUiState());
-                return null;
             }
-            let passphrase = zkRuntime.passphrase;
-            if (zkCache.state != null && zkCache.passphrase === passphrase) {
-                return zkCache.state;
-            }
-            let masterKey = toByteArray(await derivePrivateKeyFromPassphrase(passphrase));
-            let filenameObfuscationKey = toByteArray(await hash256(masterKey));
-            let contentMaster = blake2b512(concatBytes([masterKey, filenameObfuscationKey]), 64);
-            zkCache.passphrase = passphrase;
-            zkCache.state = {
-                masterKey: masterKey,
-                filenameObfuscationKey: filenameObfuscationKey,
-                contentMaster: contentMaster,
-            };
-            zkLog("Zero knowledge state created.", {
-                keyLen: masterKey.byteLength,
-                filenameKeyHash4: bufferToHex((await hash256(filenameObfuscationKey)).slice(0, 4)),
-            });
             return zkCache.state;
         }
 
@@ -1739,7 +1731,7 @@
             if (!path || path.startsWith(":")) {
                 return path;
             }
-            let state = await getZeroKnowledgeState();
+            let state = getZeroKnowledgeState();
             if (state == null) {
                 return path;
             }
@@ -1750,7 +1742,7 @@
             if (!path || path.startsWith(":")) {
                 return path;
             }
-            let state = await getZeroKnowledgeState();
+            let state = getZeroKnowledgeState();
             if (state == null) {
                 return path;
             }
@@ -1759,7 +1751,7 @@
 
         async function encryptFileForTransport(clearFullPath, clearData, unixLastWriteTimestamp) {
             clearFullPath = normalizeRelativeUnixPath(clearFullPath);
-            let state = await getZeroKnowledgeState();
+            let state = getZeroKnowledgeState();
             if (state == null) {
                 zkLog("Upload uses clear payload (no ZK state).", clearFullPath);
                 return {
@@ -1790,7 +1782,7 @@
 
         async function decryptFileFromTransport(virtualFullPath, encryptedData, unixLastWriteTimestamp) {
             virtualFullPath = normalizeRelativeUnixPath(virtualFullPath);
-            let state = await getZeroKnowledgeState();
+            let state = getZeroKnowledgeState();
             if (state == null || !isEncryptedVirtualPath(virtualFullPath)) {
                 zkLog("Download payload left clear.", {
                     virtualFullPath: virtualFullPath,
@@ -2726,31 +2718,28 @@
 
         }
 
-        function authentication(auth) {
-            rebuildZeroKnowledgeRuntimeFromUi();
-
+        async function authentication(auth) {
+            await rebuildZeroKnowledgeRuntimeFromUi();
             let pin = Number(document.getElementById("pin").value);
             let pin4 = int32ToBuffer(pin);
             let authentication = joinBuffers(auth, pin4);
-            hash256(authentication).then(hash => {
-                let verify = hash.slice(0, 4);
-                getZeroKnowledgeChecksum().then(zeroKnowledgeChecksum => {
-                    if (zeroKnowledgeChecksum) {
-                        executeRequest(command.Authentication, joinBuffers(verify, zeroKnowledgeChecksum));
-                    } else {
-                        executeRequest(command.Authentication, verify);
-                    }
-                });
-            });
+            let hash = await hash256(authentication);
+            let verify = hash.slice(0, 4);
+            let zeroKnowledgeChecksum = await getZeroKnowledgeChecksum();
+            if (zeroKnowledgeChecksum) {
+                executeRequest(command.Authentication, joinBuffers(verify, zeroKnowledgeChecksum));
+            } else {
+                executeRequest(command.Authentication, verify);
+            }
         }
 
-        function getZeroKnowledgeChecksum() {
-            return getZeroKnowledgeState().then(state => {
-                if (state == null) {
-                    return null;
-                }
-                return hash256(state.filenameObfuscationKey).then(checksum => checksum.slice(0, 4));
-            });
+        async function getZeroKnowledgeChecksum() {
+            let state = getZeroKnowledgeState();
+            if (state == null) {
+                return null;
+            }
+            let checksum = await hash256(state.filenameObfuscationKey);
+            return checksum.slice(0, 4);
         }
 
         function cleanPassphrase(passphrase) {
@@ -2819,7 +2808,7 @@
 
 
         function persistZeroKnowledgePassphraseOnSuccessfulConnection() {
-            writeZkPassphraseToStorage(zkRuntime.enabled ? zkRuntime.passphrase : "");
+            writeZkPassphraseToStorage(zkPassphrase);
         }
 
         function setClient(rsaPubKey) {
@@ -3633,19 +3622,20 @@
         if (isDebug) {
             proxy = "https://localhost:7060";
         }
-        initZeroKnowledgeRuntimeFromStorage();
         let reset = false;
-        if (reset) {
-            DeleteClient(); // Logout and delete current client account == LOGOUT ==
-        } else {
-            // Load last Client if exist, in order to remain logged in the previous session
-            // NOTE: In production this function must be protected by a pin, or the application must ask for a pin at startup
-            LoadClient(0).then(loaded => {
+        (async function initializeApp() {
+            await initZeroKnowledgeRuntimeFromStorage();
+            if (reset) {
+                await DeleteClient(); // Logout and delete current client account == LOGOUT ==
+            } else {
+                // Load last Client if exist, in order to remain logged in the previous session
+                // NOTE: In production this function must be protected by a pin, or the application must ask for a pin at startup
+                let loaded = await LoadClient(0);
                 if (!loaded) {
-                    NewSession(); // If a saved session was not found, create a new one
+                    await NewSession(); // If a saved session was not found, create a new one
                 }
-            })
-        }
+            }
+        })();
 
     </script>
 

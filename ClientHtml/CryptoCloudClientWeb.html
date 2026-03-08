@@ -1500,12 +1500,12 @@
             });
         }
 
-        async function initZeroKnowledgeRuntimeFromStorage() {
+        async function initializeZeroKnowledgeStateFromStorage() {
             setZeroKnowledgePassphrase(readZkPassphraseFromStorage());
             await initializeZeroKnowledgeState();
         }
 
-        async function rebuildZeroKnowledgeRuntimeFromUi() {
+        async function initializeZeroKnowledgeStateFromUi() {
             let checkbox = document.getElementById("zkEnabled");
             let input = document.getElementById("zkpass");
             if (!!checkbox && !!input) {
@@ -2719,7 +2719,7 @@
         }
 
         async function authentication(auth) {
-            await rebuildZeroKnowledgeRuntimeFromUi();
+            await initializeZeroKnowledgeStateFromUi();
             let pin = Number(document.getElementById("pin").value);
             let pin4 = int32ToBuffer(pin);
             let authentication = joinBuffers(auth, pin4);
@@ -3624,7 +3624,7 @@
         }
         let reset = false;
         (async function initializeApp() {
-            await initZeroKnowledgeRuntimeFromStorage();
+            await initializeZeroKnowledgeStateFromStorage();
             if (reset) {
                 await DeleteClient(); // Logout and delete current client account == LOGOUT ==
             } else {

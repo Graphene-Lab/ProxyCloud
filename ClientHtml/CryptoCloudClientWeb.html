@@ -2815,7 +2815,6 @@
                 input.value = "";
                 container.style.display = "none";
             }
-            rebuildZeroKnowledgeRuntimeFromUi();
         }
 
 
@@ -3634,42 +3633,20 @@
         if (isDebug) {
             proxy = "https://localhost:7060";
         }
-
+        initZeroKnowledgeRuntimeFromStorage();
         let reset = false;
-
-        function startApp() {
-            let zkPassInput = document.getElementById("zkpass");
-            let zkCheckbox = document.getElementById("zkEnabled");
-
-            if (zkPassInput) {
-                zkPassInput.addEventListener("input", function () {
-                    rebuildZeroKnowledgeRuntimeFromUi();
-                });
-            }
-            if (zkCheckbox) {
-                zkCheckbox.addEventListener("change", function () {
-                    onZeroKnowledgeToggle();
-                });
-            }
-            initZeroKnowledgeRuntimeFromStorage();
-            if (reset) {
-                DeleteClient(); // Logout and delete current client account == LOGOUT ==
-            } else {
-                // Load last Client if exist, in order to remain logged in the previous session
-                // NOTE: In production this function must be protected by a pin, or the application must ask for a pin at startup
-                LoadClient(0).then(loaded => {
-                    if (!loaded) {
-                        NewSession(); // If a saved session was not found, create a new one
-                    }
-                })
-            }
-        }
-
-        if (document.readyState === "loading") {
-            document.addEventListener("DOMContentLoaded", startApp, { once: true });
+        if (reset) {
+            DeleteClient(); // Logout and delete current client account == LOGOUT ==
         } else {
-            startApp();
+            // Load last Client if exist, in order to remain logged in the previous session
+            // NOTE: In production this function must be protected by a pin, or the application must ask for a pin at startup
+            LoadClient(0).then(loaded => {
+                if (!loaded) {
+                    NewSession(); // If a saved session was not found, create a new one
+                }
+            })
         }
+
     </script>
 
     <style>

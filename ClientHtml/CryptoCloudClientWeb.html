@@ -1491,15 +1491,17 @@
             }
         }
 
-        function rebuildZeroKnowledgeRuntimeFromUiOrStorage() {
+        function initZeroKnowledgeRuntimeFromStorage() {
+            let passphrase = readZkPassphraseFromStorage();
+            applyZeroKnowledgeRuntime(passphrase, true);
+        }
+
+        function rebuildZeroKnowledgeRuntimeFromUi() {
             let checkbox = document.getElementById("zkEnabled");
             let input = document.getElementById("zkpass");
             if (!!checkbox && !!input) {
                 applyZeroKnowledgeRuntime(input.value || "", checkbox.checked === true);
-                return;
             }
-            let passphrase = readZkPassphraseFromStorage();
-            applyZeroKnowledgeRuntime(passphrase, true);
         }
 
         function bytesPreviewHex(data, maxLen) {
@@ -2725,6 +2727,7 @@
         }
 
         function authentication(auth) {
+            rebuildZeroKnowledgeRuntimeFromUi();
 
             let pin = Number(document.getElementById("pin").value);
             let pin4 = int32ToBuffer(pin);
@@ -2812,17 +2815,9 @@
                 input.value = "";
                 container.style.display = "none";
             }
-            rebuildZeroKnowledgeRuntimeFromUiOrStorage();
+            rebuildZeroKnowledgeRuntimeFromUi();
         }
 
-        function syncZeroKnowledgeUiOnly() {
-            let checkbox = document.getElementById("zkEnabled");
-            let container = document.getElementById("zkContainer");
-            if (!checkbox || !container) {
-                return;
-            }
-            container.style.display = checkbox.checked ? "block" : "none";
-        }
 
         function persistZeroKnowledgePassphraseOnSuccessfulConnection() {
             writeZkPassphraseToStorage(zkRuntime.enabled ? zkRuntime.passphrase : "");
@@ -3645,20 +3640,10 @@
         function startApp() {
             let zkPassInput = document.getElementById("zkpass");
             let zkCheckbox = document.getElementById("zkEnabled");
-            let storedPassphrase = readZkPassphraseFromStorage();
-
-            if (zkCheckbox) {
-                zkCheckbox.checked = !!storedPassphrase && storedPassphrase.trim() !== "";
-            }
-            if (zkPassInput) {
-                if (storedPassphrase && !zkPassInput.value) {
-                    zkPassInput.value = storedPassphrase;
-                }
-            }
 
             if (zkPassInput) {
                 zkPassInput.addEventListener("input", function () {
-                    rebuildZeroKnowledgeRuntimeFromUiOrStorage();
+                    rebuildZeroKnowledgeRuntimeFromUi();
                 });
             }
             if (zkCheckbox) {
@@ -3666,8 +3651,7 @@
                     onZeroKnowledgeToggle();
                 });
             }
-            syncZeroKnowledgeUiOnly();
-            rebuildZeroKnowledgeRuntimeFromUiOrStorage();
+            initZeroKnowledgeRuntimeFromStorage();
             if (reset) {
                 DeleteClient(); // Logout and delete current client account == LOGOUT ==
             } else {
@@ -3988,7 +3972,6 @@
                             qr.value = queryQr;
                             qr.readOnly = true;
                         }
-                        syncZeroKnowledgeUiOnly();
                     </script>
                 </fieldset>
                 <div class="info">

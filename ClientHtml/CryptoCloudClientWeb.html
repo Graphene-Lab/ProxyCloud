@@ -1542,17 +1542,7 @@
             }
         }
 
-        function getZeroKnowledgePassphrase() {
-            if (!zkRuntime.initialized) {
-                rebuildZeroKnowledgeRuntimeFromUiOrStorage();
-            }
-            return zkRuntime.passphrase;
-        }
-
         function shouldUseZeroKnowledge() {
-            if (!zkRuntime.initialized) {
-                rebuildZeroKnowledgeRuntimeFromUiOrStorage();
-            }
             return zkRuntime.enabled === true && !!zkRuntime.passphrase && zkRuntime.passphrase.trim() !== "";
         }
 
@@ -1723,7 +1713,7 @@
                 zkLog("Zero knowledge disabled (passphrase missing).", getZeroKnowledgeUiState());
                 return null;
             }
-            let passphrase = getZeroKnowledgePassphrase();
+            let passphrase = zkRuntime.passphrase;
             if (zkCache.state != null && zkCache.passphrase === passphrase) {
                 return zkCache.state;
             }
@@ -2835,9 +2825,6 @@
         }
 
         function persistZeroKnowledgePassphraseOnSuccessfulConnection() {
-            if (!zkRuntime.initialized) {
-                rebuildZeroKnowledgeRuntimeFromUiOrStorage();
-            }
             writeZkPassphraseToStorage(zkRuntime.enabled ? zkRuntime.passphrase : "");
         }
 

@@ -1029,6 +1029,8 @@
 
         // id = id of client to delete, if is undefined, then the id is the id of current session (if the user are logged in the cloud)
         // if you delete the current sesion (the id is the id of current session), then automatically start a new session
+       
+
         async function DeleteClient(id) {
             if (id == undefined && session != null && session.id != null) {
                 id = session.id;
@@ -1037,22 +1039,25 @@
                 localStorage.removeItem(id);
             }
             if (session != null && session.id == id) {
-                clearZeroKnowledgeCache();
-                writeZkPassphraseToStorage("");
-                let zkPassInput = document.getElementById("zkpass");
-                if (zkPassInput) {
-                    zkPassInput.value = "";
-                }
-                let zkCheckbox = document.getElementById("zkEnabled");
-                if (zkCheckbox) {
-                    zkCheckbox.checked = false;
-                }
-                setZeroKnowledgePassphrase("");
+                resetZeroKnowledgeUiAndState();
                 await NewSession(id);
                 // Return to the initial login screen immediately after deleting the session.
                 window.location.reload();
             }
+
+            function resetZeroKnowledgeUiAndState() {
+            writeZkPassphraseToStorage("");
+            setZeroKnowledgePassphrase("");
+            let zkPassInput = document.getElementById("zkpass");
+            if (zkPassInput) {
+                zkPassInput.value = "";
+            }
+            let zkCheckbox = document.getElementById("zkEnabled");
+            if (zkCheckbox) {
+                zkCheckbox.checked = false;
+            }
         }
+    }
 
     </script>
 

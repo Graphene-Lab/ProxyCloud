@@ -1494,7 +1494,17 @@
 
         function readZkPassphraseFromStorage() {
             try {
-                return sessionStorage.getItem(ZK_STORAGE_PASSPHRASE_KEY) || "";
+                let pass = localStorage.getItem(ZK_STORAGE_PASSPHRASE_KEY);
+                if (pass != null) {
+                    return pass;
+                }
+                pass = sessionStorage.getItem(ZK_STORAGE_PASSPHRASE_KEY);
+                if (pass != null) {
+                    localStorage.setItem(ZK_STORAGE_PASSPHRASE_KEY, pass);
+                    sessionStorage.removeItem(ZK_STORAGE_PASSPHRASE_KEY);
+                    return pass;
+                }
+                return "";
             } catch (e) {
                 return "";
             }
@@ -1503,9 +1513,11 @@
         function writeZkPassphraseToStorage(passphrase) {
             try {
                 if (!passphrase) {
+                    localStorage.removeItem(ZK_STORAGE_PASSPHRASE_KEY);
                     sessionStorage.removeItem(ZK_STORAGE_PASSPHRASE_KEY);
                 } else {
-                    sessionStorage.setItem(ZK_STORAGE_PASSPHRASE_KEY, passphrase);
+                    localStorage.setItem(ZK_STORAGE_PASSPHRASE_KEY, passphrase);
+                    sessionStorage.removeItem(ZK_STORAGE_PASSPHRASE_KEY);
                 }
             } catch (e) {
             }
@@ -1521,13 +1533,8 @@
         }
 
         function shouldUseZeroKnowledge() {
-            let enabled = document.getElementById("zkEnabled");
-            let input = document.getElementById("zkpass");
-            if (!!enabled && !!input) {
-                return enabled.checked === true && !!input.value && input.value.trim() !== "";
-            }
-            let passphrase = readZkPassphraseFromStorage();
-            return readZkEnabledFromStorage() && !!passphrase && passphrase.trim() !== "";
+            let passphrase = getZeroKnowledgePassphrase();
+            return !!passphrase && passphrase.trim() !== "";
         }
 
         function getZeroKnowledgeUiState() {
@@ -1695,7 +1702,7 @@
 
         async function getZeroKnowledgeState() {
             if (!shouldUseZeroKnowledge()) {
-                zkLog("Zero knowledge disabled (checkbox/passphrase missing).", getZeroKnowledgeUiState());
+                zkLog("Zero knowledge disabled (passphrase missing).", getZeroKnowledgeUiState());
                 return null;
             }
             let passphrase = getZeroKnowledgePassphrase();
@@ -2800,6 +2807,14 @@
                 writeZkPassphraseToStorage("");
             }
         }
+        function syncZeroKnowledgeUiOnly() {
+            let checkbox = document.getElementById("zkEnabled");
+            let container = document.getElementById("zkContainer");
+            if (!checkbox || !container) {
+                return;
+            }
+            container.style.display = checkbox.checked ? "block" : "none";
+        }
         function setClient(rsaPubKey) {
             session.deviceKey = null; // the server will send a new encryption key
             let clientPublicKey = base64ToBuffer(session.publicKeyB64);
@@ -3653,7 +3668,8 @@
                     }
                 }
             } else {
-                onZeroKnowledgeToggle();
+                // Startup should not clear stored passphrase when checkbox defaults to unchecked.
+                syncZeroKnowledgeUiOnly();
             }
             if (reset) {
                 DeleteClient(); // Logout and delete current client account == LOGOUT ==
@@ -3975,7 +3991,7 @@
                             qr.value = queryQr;
                             qr.readOnly = true;
                         }
-                        onZeroKnowledgeToggle();
+                        syncZeroKnowledgeUiOnly();
                     </script>
                 </fieldset>
                 <div class="info">

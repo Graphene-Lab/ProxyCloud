@@ -3216,6 +3216,17 @@
                 parent.removeChild(parent.firstChild);
             }
         }
+
+        function getParentCloudPath(path) {
+            path = normalizeRelativeUnixPath(path);
+            if (path === "") {
+                return "";
+            }
+            let parts = path.split("/");
+            parts.pop();
+            return parts.join("/");
+        }
+
         function addFile(file, idx) {
             let content = document.getElementById("content");
             if (idx == 0) {
@@ -3236,7 +3247,11 @@
 
             if (file.IsDirectory) {
                 fileItemBox.onclick = function (event) {
-                    getDir(currentPath + "/" + file.Name);
+                    if (file.Name === "..") {
+                        getDir(getParentCloudPath(currentPath));
+                    } else {
+                        getDir(currentPath == "" ? file.Name : currentPath + "/" + file.Name);
+                    }
                 }
             } else {
                 fileItemBox.onclick = function (event) {

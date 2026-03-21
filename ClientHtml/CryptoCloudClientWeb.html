@@ -3533,10 +3533,10 @@
             } else if (ep.indexOf(".") == -1) {
                 ep = ep + ".tc0.it";
             }
-            let json = await resolveDNS(ep);
-            if (json.Answer && json.Answer.length > 0) {
-                ep = json.Answer[0].data;
-            }
+            // let json = await resolveDNS(ep);
+            // if (json.Answer && json.Answer.length > 0) {
+            //     ep = json.Answer[0].data;
+            // }
             if (!ep.startsWith("http")) {
                 ep = "http://" + ep;
             }

@@ -874,6 +874,7 @@
         }
 
         function bytesToSize(bytes) {
+            if (bytes == -1) return 'Unlimited';
             var sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
             if (bytes == 0) return '0 Byte';
             var i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
@@ -1101,6 +1102,18 @@
             offset = offset != undefined ? offset : 0;
             let bytes = data.slice(offset, offset + 4);
             return new Int32Array(bytes)[0];
+        }
+
+        function bufferToInt64(data, offset) {
+            offset = offset != undefined ? offset : 0;
+            let bytes = data.slice(offset, offset + 8);
+            let view = new DataView(bytes);
+            if (typeof view.getBigInt64 === "function") {
+                return Number(view.getBigInt64(0, true));
+            }
+            let low = view.getUint32(0, true);
+            let high = view.getInt32(4, true);
+            return high * 4294967296 + low;
         }
 
         function bufferToUint(data, offset) {
@@ -2468,6 +2481,22 @@
             GetStorageInfo: 18,
             GetOccupiedSpace: 19,
             GetEncryptedQR: 20,
+            GetFreeSpace: 21,
+            GetUsedSpace: 22,
+        }
+
+        const quotaStorageInfoState = {
+            freeSpace: null,
+            usedSpace: null
+        };
+
+        function alertQuotaStorageInfoIfComplete() {
+            if (quotaStorageInfoState.freeSpace === null || quotaStorageInfoState.usedSpace === null) {
+                return;
+            }
+            alertBox("used space = " + bytesToSize(quotaStorageInfoState.usedSpace) + " ; free space = " + bytesToSize(quotaStorageInfoState.freeSpace));
+            quotaStorageInfoState.freeSpace = null;
+            quotaStorageInfoState.usedSpace = null;
         }
 
         // Action that is performed when a response arrives to a command that has been sent
@@ -2690,6 +2719,14 @@
                 let freeSpace = bufferToString(params[0]);
                 let usedSpace = bufferToString(params[1]);
                 alertBox("used space = " + bytesToSize(usedSpace) + " ; free space = " + bytesToSize(freeSpace));
+            },
+            GetFreeSpace: function (params) {
+                quotaStorageInfoState.freeSpace = bufferToInt64(params[0]);
+                alertQuotaStorageInfoIfComplete();
+            },
+            GetUsedSpace: function (params) {
+                quotaStorageInfoState.usedSpace = bufferToInt64(params[0]);
+                alertQuotaStorageInfoIfComplete();
             },
             GetOccupiedSpace: function (params) {
                 let path = bufferToString(params[0]);
@@ -3061,7 +3098,10 @@
             }
         }
         function GetStorageInfo() {
-            executeRequest(command.GetStorageInfo);
+            quotaStorageInfoState.freeSpace = null;
+            quotaStorageInfoState.usedSpace = null;
+            executeRequest(command.GetFreeSpace);
+            executeRequest(command.GetUsedSpace);
         }
         async function GetOccupiedSpace(path, wilscards) {
             // The wildcard can be replaced by regular expressions to perform advanced searches

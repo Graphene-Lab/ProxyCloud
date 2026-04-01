@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 
 <head>
@@ -874,6 +874,7 @@
         }
 
         function bytesToSize(bytes) {
+            if (bytes == -1) return 'Unlimited';
             var sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
             if (bytes == 0) return '0 Byte';
             var i = parseInt(Math.floor(Math.log(bytes) / Math.log(1024)));
@@ -1006,10 +1007,13 @@
 
         async function LoadClient(id) {
             let json = localStorage.getItem(id);
-            if (json != null) {
+            if (json != null && json !== "null") {
                 session = JSON.parse(json);
+                if (!session) {
+                    return false;
+                }
                 await entryPointToProxy(session.entryPoint);
-                if (session.encryptionType = "aes") {
+                if (session.encryptionType == "aes") {
                     importSecretKey(base64ToBuffer(session.deviceKey)).then(
                         key => {
                             cryptoKey = key;
@@ -1026,17 +1030,35 @@
 
         // id = id of client to delete, if is undefined, then the id is the id of current session (if the user are logged in the cloud)
         // if you delete the current sesion (the id is the id of current session), then automatically start a new session
-        function DeleteClient(id) {
+       
+
+        async function DeleteClient(id) {
             if (id == undefined && session != null && session.id != null) {
                 id = session.id;
             }
             if (id != undefined) {
-                localStorage.setItem(id, null);
+                localStorage.removeItem(id);
             }
             if (session != null && session.id == id) {
-                NewSession(id);
+                resetZeroKnowledgeUiAndState();
+                await NewSession(id);
+                // Return to the initial login screen immediately after deleting the session.
+                window.location.reload();
+            }
+
+            function resetZeroKnowledgeUiAndState() {
+            writeZkPassphraseToStorage("");
+            setZeroKnowledgePassphrase("");
+            let zkPassInput = document.getElementById("zkpass");
+            if (zkPassInput) {
+                zkPassInput.value = "";
+            }
+            let zkCheckbox = document.getElementById("zkEnabled");
+            if (zkCheckbox) {
+                zkCheckbox.checked = false;
             }
         }
+    }
 
     </script>
 
@@ -1080,6 +1102,18 @@
             offset = offset != undefined ? offset : 0;
             let bytes = data.slice(offset, offset + 4);
             return new Int32Array(bytes)[0];
+        }
+
+        function bufferToInt64(data, offset) {
+            offset = offset != undefined ? offset : 0;
+            let bytes = data.slice(offset, offset + 8);
+            let view = new DataView(bytes);
+            if (typeof view.getBigInt64 === "function") {
+                return Number(view.getBigInt64(0, true));
+            }
+            let low = view.getUint32(0, true);
+            let high = view.getInt32(4, true);
+            return high * 4294967296 + low;
         }
 
         function bufferToUint(data, offset) {
@@ -1185,6 +1219,617 @@
 
         async function hash512(buffer) {
             return crypto.subtle.digest('SHA-512', buffer);
+        }
+
+        function toByteArray(data) {
+            if (data instanceof Uint8Array) {
+                return data;
+            }
+            if (data instanceof ArrayBuffer) {
+                return new Uint8Array(data);
+            }
+            if (ArrayBuffer.isView(data)) {
+                return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+            }
+            throw new Error("Unsupported byte input");
+        }
+
+        function concatBytes(parts) {
+            let total = 0;
+            for (let i = 0; i < parts.length; i++) {
+                total += toByteArray(parts[i]).byteLength;
+            }
+            let output = new Uint8Array(total);
+            let offset = 0;
+            for (let i = 0; i < parts.length; i++) {
+                let part = toByteArray(parts[i]);
+                output.set(part, offset);
+                offset += part.byteLength;
+            }
+            return output;
+        }
+
+        function uint32ToBytesLE(value) {
+            value = value >>> 0;
+            return new Uint8Array([
+                value & 0xff,
+                (value >>> 8) & 0xff,
+                (value >>> 16) & 0xff,
+                (value >>> 24) & 0xff,
+            ]);
+        }
+
+        function uint64ToBytesLE(value) {
+            let v = BigInt(value);
+            let out = new Uint8Array(8);
+            for (let i = 0; i < 8; i++) {
+                out[i] = Number(v & 0xffn);
+                v >>= 8n;
+            }
+            return out;
+        }
+
+        function utf16LeBytes(text) {
+            let output = new Uint8Array(text.length * 2);
+            for (let i = 0; i < text.length; i++) {
+                let code = text.charCodeAt(i);
+                output[i * 2] = code & 0xff;
+                output[i * 2 + 1] = (code >>> 8) & 0xff;
+            }
+            return output;
+        }
+
+        function normalizeRelativeUnixPath(path) {
+            if (path === null || path === undefined) {
+                return "";
+            }
+            let value = String(path).replace(/\\/g, "/");
+            value = value.replace(/^\/+/, "").replace(/\/+$/, "");
+            return value;
+        }
+
+        const blake2b512 = (() => {
+            const IV32 = new Uint32Array([
+                0xf3bcc908, 0x6a09e667, 0x84caa73b, 0xbb67ae85, 0xfe94f82b, 0x3c6ef372,
+                0x5f1d36f1, 0xa54ff53a, 0xade682d1, 0x510e527f, 0x2b3e6c1f, 0x9b05688c,
+                0xfb41bd6b, 0x1f83d9ab, 0x137e2179, 0x5be0cd19
+            ]);
+            const SIGMA8 = [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 14, 10, 4, 8, 9, 15, 13,
+                6, 1, 12, 0, 2, 11, 7, 5, 3, 11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1,
+                9, 4, 7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8, 9, 0, 5, 7, 2, 4,
+                10, 15, 14, 1, 11, 12, 6, 8, 3, 13, 2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5,
+                15, 14, 1, 9, 12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11, 13, 11, 7,
+                14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10, 6, 15, 14, 9, 11, 3, 0, 8, 12, 2,
+                13, 7, 1, 4, 10, 5, 10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0, 0,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 14, 10, 4, 8, 9, 15, 13, 6,
+                1, 12, 0, 2, 11, 7, 5, 3
+            ];
+            const SIGMA82 = new Uint8Array(SIGMA8.map(x => x * 2));
+            const v = new Uint32Array(32);
+            const m = new Uint32Array(32);
+            const parameterBlock = new Uint8Array(64);
+
+            function add64aa(arr, a, b) {
+                const o0 = arr[a] + arr[b];
+                let o1 = arr[a + 1] + arr[b + 1];
+                if (o0 >= 0x100000000) {
+                    o1++;
+                }
+                arr[a] = o0;
+                arr[a + 1] = o1;
+            }
+
+            function add64ac(arr, a, b0, b1) {
+                let o0 = arr[a] + b0;
+                if (b0 < 0) {
+                    o0 += 0x100000000;
+                }
+                let o1 = arr[a + 1] + b1;
+                if (o0 >= 0x100000000) {
+                    o1++;
+                }
+                arr[a] = o0;
+                arr[a + 1] = o1;
+            }
+
+            function get32(arr, i) {
+                return arr[i] ^ (arr[i + 1] << 8) ^ (arr[i + 2] << 16) ^ (arr[i + 3] << 24);
+            }
+
+            function G(a, b, c, d, ix, iy) {
+                const x0 = m[ix];
+                const x1 = m[ix + 1];
+                const y0 = m[iy];
+                const y1 = m[iy + 1];
+
+                add64aa(v, a, b);
+                add64ac(v, a, x0, x1);
+
+                let xor0 = v[d] ^ v[a];
+                let xor1 = v[d + 1] ^ v[a + 1];
+                v[d] = xor1;
+                v[d + 1] = xor0;
+
+                add64aa(v, c, d);
+
+                xor0 = v[b] ^ v[c];
+                xor1 = v[b + 1] ^ v[c + 1];
+                v[b] = (xor0 >>> 24) ^ (xor1 << 8);
+                v[b + 1] = (xor1 >>> 24) ^ (xor0 << 8);
+
+                add64aa(v, a, b);
+                add64ac(v, a, y0, y1);
+
+                xor0 = v[d] ^ v[a];
+                xor1 = v[d + 1] ^ v[a + 1];
+                v[d] = (xor0 >>> 16) ^ (xor1 << 16);
+                v[d + 1] = (xor1 >>> 16) ^ (xor0 << 16);
+
+                add64aa(v, c, d);
+
+                xor0 = v[b] ^ v[c];
+                xor1 = v[b + 1] ^ v[c + 1];
+                v[b] = (xor1 >>> 31) ^ (xor0 << 1);
+                v[b + 1] = (xor0 >>> 31) ^ (xor1 << 1);
+            }
+
+            function compress(ctx, last) {
+                let i = 0;
+                for (i = 0; i < 16; i++) {
+                    v[i] = ctx.h[i];
+                    v[i + 16] = IV32[i];
+                }
+                v[24] = v[24] ^ ctx.t;
+                v[25] = v[25] ^ (ctx.t / 0x100000000);
+                if (last) {
+                    v[28] = ~v[28];
+                    v[29] = ~v[29];
+                }
+                for (i = 0; i < 32; i++) {
+                    m[i] = get32(ctx.b, 4 * i);
+                }
+                for (i = 0; i < 12; i++) {
+                    G(0, 8, 16, 24, SIGMA82[i * 16 + 0], SIGMA82[i * 16 + 1]);
+                    G(2, 10, 18, 26, SIGMA82[i * 16 + 2], SIGMA82[i * 16 + 3]);
+                    G(4, 12, 20, 28, SIGMA82[i * 16 + 4], SIGMA82[i * 16 + 5]);
+                    G(6, 14, 22, 30, SIGMA82[i * 16 + 6], SIGMA82[i * 16 + 7]);
+                    G(0, 10, 20, 30, SIGMA82[i * 16 + 8], SIGMA82[i * 16 + 9]);
+                    G(2, 12, 22, 24, SIGMA82[i * 16 + 10], SIGMA82[i * 16 + 11]);
+                    G(4, 14, 16, 26, SIGMA82[i * 16 + 12], SIGMA82[i * 16 + 13]);
+                    G(6, 8, 18, 28, SIGMA82[i * 16 + 14], SIGMA82[i * 16 + 15]);
+                }
+                for (i = 0; i < 16; i++) {
+                    ctx.h[i] = ctx.h[i] ^ v[i] ^ v[i + 16];
+                }
+            }
+
+            function init(outlen, key) {
+                const ctx = {
+                    b: new Uint8Array(128),
+                    h: new Uint32Array(16),
+                    t: 0,
+                    c: 0,
+                    outlen: outlen,
+                };
+                let keyLength = key ? key.length : 0;
+                if (keyLength > 64) {
+                    throw new Error("Invalid BLAKE2b key size");
+                }
+                parameterBlock.fill(0);
+                parameterBlock[0] = outlen;
+                parameterBlock[1] = keyLength;
+                parameterBlock[2] = 1;
+                parameterBlock[3] = 1;
+                for (let i = 0; i < 16; i++) {
+                    ctx.h[i] = IV32[i] ^ get32(parameterBlock, i * 4);
+                }
+                if (keyLength > 0) {
+                    let keyBlock = new Uint8Array(128);
+                    keyBlock.set(key);
+                    update(ctx, keyBlock);
+                }
+                return ctx;
+            }
+
+            function update(ctx, input) {
+                for (let i = 0; i < input.length; i++) {
+                    if (ctx.c === 128) {
+                        ctx.t += ctx.c;
+                        compress(ctx, false);
+                        ctx.c = 0;
+                    }
+                    ctx.b[ctx.c++] = input[i];
+                }
+            }
+
+            function final(ctx) {
+                ctx.t += ctx.c;
+                while (ctx.c < 128) {
+                    ctx.b[ctx.c++] = 0;
+                }
+                compress(ctx, true);
+                const out = new Uint8Array(ctx.outlen);
+                for (let i = 0; i < ctx.outlen; i++) {
+                    out[i] = ctx.h[i >> 2] >> (8 * (i & 3));
+                }
+                return out;
+            }
+
+            return function hashBlake2b(input, outlen, key) {
+                outlen = outlen || 64;
+                if (outlen <= 0 || outlen > 64) {
+                    throw new Error("Invalid BLAKE2b output size");
+                }
+                let data = toByteArray(input);
+                let keyBytes = key ? toByteArray(key) : null;
+                let ctx = init(outlen, keyBytes);
+                update(ctx, data);
+                return final(ctx);
+            };
+        })();
+        const ZK_ENCRYPT_FILE_NAME_END_CHAR = "\u2047";
+        const ZK_SPECIAL_DIRECTORIES = [".cloud_cache"];
+        const ZK_SET256_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\u00C0\u00C1\u00C2\u00C3\u00C4\u00C5\u00C6\u00C7\u00C8\u00C9\u00CA\u00CB\u00CC\u00CD\u00CE\u00CF\u00D0\u00D1\u00D2\u00D3\u00D4\u00D5\u00D6\u00D8\u00D9\u00DA\u00DB\u00DC\u00DD\u00DE\u00DF\u00E0\u00E1\u00E2\u00E3\u00E4\u00E5\u00E6\u00E7\u00E8\u00E9\u00EA\u00EB\u00EC\u00ED\u00EE\u00EF\u00F0\u00F1\u00F2\u00F3\u00F4\u00F5\u00F6\u00F8\u00F9\u00FA\u00FB\u00FC\u00FD\u00FE\u00FF\u0100\u0101\u0102\u0103\u0104\u0105\u0106\u0107\u0108\u0109\u010A\u010B\u010C\u010D\u010E\u010F\u0110\u0111\u0112\u0113\u0114\u0115\u0116\u0117\u0118\u0119\u011A\u011B\u011C\u011D\u011E\u011F\u0120\u0121\u0122\u0123\u0124\u0125\u0126\u0127\u0128\u0129\u012A\u012B\u012C\u012D\u012E\u012F\u0130\u0131\u0132\u0133\u0134\u0135\u0136\u0137\u0139\u013A\u013B\u013C\u013D\u013E\u0141\u0142\u0143\u0144\u0145\u0146\u0147\u0148\u014C\u014D\u014E\u014F\u0150\u0151\u0152\u0153\u0154\u0155\u0156\u0157\u0158\u0159\u015A\u015B\u015C\u015D\u015E\u015F\u0160\u0161\u0162\u0163\u0164\u0165\u0166\u0167\u0168\u0169\u016A\u016B\u016C\u016D\u016E\u016F\u0170\u0171\u0172\u0173\u0174\u0175\u0176\u0177\u0178\u0179\u017A\u017B\u017C\u017D\u017E\u01CD\u01CE\u01CF\u01D0\u01D1\u01D2\u01D3\u01D4\u01D5\u01D6\u01D7";
+        const ZK_STORAGE_PASSPHRASE_KEY = "cloud.zk.passphrase";
+        let zkDecryptHelper = null;
+        let zkCache = {
+            passphrase: null,
+            state: null,
+        };
+        let zkPassphrase = "";
+
+        function zkLog() {
+            let args = Array.from(arguments);
+            args.unshift("[ZK]");
+            console.log.apply(console, args);
+        }
+
+        function clearZeroKnowledgeCache() {
+            zkCache.passphrase = null;
+            zkCache.state = null;
+        }
+
+        function setZeroKnowledgePassphrase(passphrase) {
+            let nextPassphrase = typeof passphrase === "string" && passphrase.trim() !== "" ? passphrase : "";
+            if (zkPassphrase === nextPassphrase) {
+                return;
+            }
+            zkPassphrase = nextPassphrase;
+            clearZeroKnowledgeCache();
+        }
+
+        async function initializeZeroKnowledgeState() {
+            if (!shouldUseZeroKnowledge()) {
+                return;
+            }
+            let masterKey = toByteArray(await derivePrivateKeyFromPassphrase(zkPassphrase));
+            let filenameObfuscationKey = toByteArray(await hash256(masterKey));
+            let contentMaster = blake2b512(concatBytes([masterKey, filenameObfuscationKey]), 64);
+            zkCache.passphrase = zkPassphrase;
+            zkCache.state = {
+                masterKey: masterKey,
+                filenameObfuscationKey: filenameObfuscationKey,
+                contentMaster: contentMaster,
+            };
+            zkLog("Zero knowledge state created.", {
+                keyLen: masterKey.byteLength,
+                filenameKeyHash4: bufferToHex((await hash256(filenameObfuscationKey)).slice(0, 4)),
+            });
+        }
+
+        async function initializeZeroKnowledgeStateFromStorage() {
+            setZeroKnowledgePassphrase(readZkPassphraseFromStorage());
+            await initializeZeroKnowledgeState();
+        }
+
+        async function initializeZeroKnowledgeStateFromUi() {
+            let checkbox = document.getElementById("zkEnabled");
+            let input = document.getElementById("zkpass");
+            if (!!checkbox && !!input) {
+                setZeroKnowledgePassphrase(checkbox.checked === true ? (input.value || "") : "");
+            }
+            await initializeZeroKnowledgeState();
+        }
+
+        function bytesPreviewHex(data, maxLen) {
+            let src = toByteArray(data);
+            let take = maxLen || 16;
+            if (take > src.length) {
+                take = src.length;
+            }
+            let s = "";
+            for (let i = 0; i < take; i++) {
+                let h = src[i].toString(16);
+                if (h.length < 2) {
+                    h = "0" + h;
+                }
+                s += h;
+            }
+            return s;
+        }
+
+        function readZkPassphraseFromStorage() {
+            try {
+                let pass = localStorage.getItem(ZK_STORAGE_PASSPHRASE_KEY);
+                if (pass != null) {
+                    return pass;
+                }
+                return "";
+            } catch (e) {
+                return "";
+            }
+        }
+
+        function writeZkPassphraseToStorage(passphrase) {
+            try {
+                if (!passphrase) {
+                    localStorage.removeItem(ZK_STORAGE_PASSPHRASE_KEY);
+                } else {
+                    localStorage.setItem(ZK_STORAGE_PASSPHRASE_KEY, passphrase);
+                }
+            } catch (e) {
+            }
+        }
+
+        function shouldUseZeroKnowledge() {
+            return !!zkPassphrase && zkPassphrase.trim() !== "";
+        }
+
+        function getZeroKnowledgeUiState() {
+            let checkbox = document.getElementById("zkEnabled");
+            let input = document.getElementById("zkpass");
+            let passphrase = zkPassphrase;
+            return {
+                hasCheckbox: !!checkbox,
+                enabled: shouldUseZeroKnowledge(),
+                passphraseLen: passphrase ? passphrase.length : 0,
+                passphraseTrimLen: passphrase ? passphrase.trim().length : 0,
+                hasPassInput: !!input,
+            };
+        }
+
+        function isEncryptedVirtualPath(path) {
+            if (!path) {
+                return false;
+            }
+            let parts = path.split(/[\/\\]/);
+            if (parts.length === 0) {
+                return false;
+            }
+            return parts[parts.length - 1].endsWith(ZK_ENCRYPT_FILE_NAME_END_CHAR);
+        }
+
+        function performEncryptText(text, key) {
+            let bytes = new TextEncoder().encode(text);
+            let masterKey = concatBytes([key, new Uint8Array([bytes.length & 0xff])]);
+            let mask = new Uint8Array(0);
+            while (mask.length < bytes.length) {
+                masterKey = blake2b512(masterKey, 64);
+                mask = concatBytes([mask, masterKey]);
+            }
+            let result = "";
+            for (let i = 0; i < bytes.length; i++) {
+                result += ZK_SET256_CHARS[bytes[i] ^ mask[i]];
+            }
+            return result;
+        }
+
+        function performDecryptText(text, key) {
+            if (zkDecryptHelper == null) {
+                zkDecryptHelper = {};
+                for (let i = 0; i < ZK_SET256_CHARS.length; i++) {
+                    zkDecryptHelper[ZK_SET256_CHARS[i]] = i;
+                }
+            }
+            let bytes = new Uint8Array(text.length);
+            let masterKey = concatBytes([key, new Uint8Array([bytes.length & 0xff])]);
+            let mask = new Uint8Array(0);
+            while (mask.length < bytes.length) {
+                masterKey = blake2b512(masterKey, 64);
+                mask = concatBytes([mask, masterKey]);
+            }
+            for (let i = 0; i < bytes.length; i++) {
+                bytes[i] = (zkDecryptHelper[text[i]] ^ mask[i]) & 0xff;
+            }
+            return new TextDecoder().decode(bytes);
+        }
+
+        function encryptFileNameZk(fileName, key) {
+            if (fileName === null || fileName === undefined || fileName === "") {
+                return fileName;
+            }
+            let hasLeadingDot = fileName.startsWith(".");
+            let namePart = hasLeadingDot ? fileName.substring(1) : fileName;
+            let encryptedName = performEncryptText(namePart, key);
+            return hasLeadingDot ? "." : "" + encryptedName + ZK_ENCRYPT_FILE_NAME_END_CHAR;
+        }
+
+        function decryptFileNameZk(encryptedFileName, key) {
+            if (!encryptedFileName.endsWith(ZK_ENCRYPT_FILE_NAME_END_CHAR)) {
+                return encryptedFileName;
+            }
+            encryptedFileName = encryptedFileName.substring(0, encryptedFileName.length - 1);
+            if (encryptedFileName === "") {
+                return encryptedFileName;
+            }
+            let hasLeadingDot = encryptedFileName.startsWith(".");
+            let encodedPart = hasLeadingDot ? encryptedFileName.substring(1) : encryptedFileName;
+            let namePart = performDecryptText(encodedPart, key);
+            return hasLeadingDot ? "." : "" + namePart;
+        }
+
+        function encryptFullFileNameZk(fullFileName, key) {
+            let parts = fullFileName.split(/[\/\\]/);
+            let clearFolder = false;
+            let output = [];
+            for (let i = 0; i < parts.length; i++) {
+                let part = parts[i];
+                if (ZK_SPECIAL_DIRECTORIES.indexOf(part) >= 0) {
+                    clearFolder = true;
+                }
+                output.push(clearFolder ? part : encryptFileNameZk(part, key));
+            }
+            return output.join("/");
+        }
+
+        function decryptFullFileNameZk(fullFileName, key) {
+            let parts = fullFileName.split(/[\/\\]/);
+            let clearFolder = false;
+            let output = [];
+            for (let i = 0; i < parts.length; i++) {
+                let part = parts[i];
+                if (ZK_SPECIAL_DIRECTORIES.indexOf(part) >= 0) {
+                    clearFolder = true;
+                }
+                output.push(clearFolder ? part : decryptFileNameZk(part, key));
+            }
+            return output.join("/");
+        }
+
+        function deriveContentKey(virtualFullPath, unixLastWriteTimestamp, contentMaster) {
+            let relativeNameBytes = utf16LeBytes(virtualFullPath);
+            let pathLengthBytes = uint64ToBytesLE(BigInt(relativeNameBytes.length));
+            let dateBytes = uint32ToBytesLE(unixLastWriteTimestamp >>> 0);
+            let payload = concatBytes([relativeNameBytes, pathLengthBytes, dateBytes, contentMaster]);
+            return blake2b512(payload, 64);
+        }
+
+        function deriveContentKeyFromClearPath(clearFullPath, unixLastWriteTimestamp, state) {
+            let normalizedClearPath = normalizeRelativeUnixPath(clearFullPath);
+            let virtualFullPath = encryptFullFileNameZk(normalizedClearPath, state.filenameObfuscationKey);
+            return deriveContentKey(virtualFullPath, unixLastWriteTimestamp >>> 0, state.contentMaster);
+        }
+
+        function cryptFileBytes(data, key) {
+            let src = toByteArray(data);
+            let output = new Uint8Array(src.length);
+            const blockSize = 8;
+            const cyclesPerHash = 8;
+            let seal = blake2b512(key, 64);
+            let current = blake2b512(seal, 64);
+            let cycle = 0;
+            let offset = 0;
+            let inputBuffer = new Uint8Array(blockSize);
+            let outputBuffer = new Uint8Array(blockSize);
+            while (offset < src.length) {
+                let bytesRead = src.length - offset;
+                if (bytesRead > blockSize) {
+                    bytesRead = blockSize;
+                }
+                let keyOffset = cycle * blockSize;
+                for (let i = 0; i < bytesRead; i++) {
+                    inputBuffer[i] = src[offset + i];
+                }
+                for (let i = 0; i < blockSize; i++) {
+                    outputBuffer[i] = inputBuffer[i] ^ current[keyOffset + i];
+                }
+                for (let i = 0; i < bytesRead; i++) {
+                    output[offset + i] = outputBuffer[i];
+                }
+                offset += bytesRead;
+                cycle++;
+                if (cycle >= cyclesPerHash) {
+                    // C#: Blake2b.ComputeHash(sealt, currentKey) => key=sealt, input=currentKey
+                    current = blake2b512(current, 64, seal);
+                    cycle = 0;
+                }
+            }
+            return output.buffer;
+        }
+
+        function getZeroKnowledgeState() {
+            if (zkCache.state == null) {
+                zkLog("Zero knowledge disabled (passphrase missing).", getZeroKnowledgeUiState());
+            }
+            return zkCache.state;
+        }
+
+        async function encryptPathForTransport(path) {
+            if (!path || path.startsWith(":")) {
+                return path;
+            }
+            let state = getZeroKnowledgeState();
+            if (state == null) {
+                return path;
+            }
+            return encryptFullFileNameZk(path, state.filenameObfuscationKey);
+        }
+
+        async function decryptPathForUi(path) {
+            if (!path || path.startsWith(":")) {
+                return path;
+            }
+            let state = getZeroKnowledgeState();
+            if (state == null) {
+                return path;
+            }
+            return decryptFullFileNameZk(path, state.filenameObfuscationKey);
+        }
+
+        async function encryptFileForTransport(clearFullPath, clearData, unixLastWriteTimestamp) {
+            clearFullPath = normalizeRelativeUnixPath(clearFullPath);
+            let state = getZeroKnowledgeState();
+            if (state == null) {
+                zkLog("Upload uses clear payload (no ZK state).", clearFullPath);
+                return {
+                    fullName: clearFullPath,
+                    data: clearData,
+                    unixLastWriteTimestamp: unixLastWriteTimestamp >>> 0,
+                };
+            }
+            let virtualFullPath = encryptFullFileNameZk(clearFullPath, state.filenameObfuscationKey);
+            let key = deriveContentKeyFromClearPath(clearFullPath, unixLastWriteTimestamp >>> 0, state);
+            let encryptedData = cryptFileBytes(clearData, key);
+            let keyHash4 = bufferToHex((await hash256(key)).slice(0, 4));
+            zkLog("Encrypt upload payload.", {
+                clearFullPath: clearFullPath,
+                virtualFullPath: virtualFullPath,
+                bytes: toByteArray(clearData).byteLength,
+                unixLastWriteTimestamp: unixLastWriteTimestamp >>> 0,
+                keyHash4: keyHash4,
+                clearHead16: bytesPreviewHex(clearData, 16),
+                encHead16: bytesPreviewHex(encryptedData, 16),
+            });
+            return {
+                fullName: virtualFullPath,
+                data: encryptedData,
+                unixLastWriteTimestamp: unixLastWriteTimestamp >>> 0,
+            };
+        }
+
+        async function decryptFileFromTransport(virtualFullPath, encryptedData, unixLastWriteTimestamp) {
+            virtualFullPath = normalizeRelativeUnixPath(virtualFullPath);
+            let state = getZeroKnowledgeState();
+            if (state == null || !isEncryptedVirtualPath(virtualFullPath)) {
+                zkLog("Download payload left clear.", {
+                    virtualFullPath: virtualFullPath,
+                    hasState: state != null,
+                    encryptedName: isEncryptedVirtualPath(virtualFullPath),
+                });
+                return {
+                    fullName: virtualFullPath,
+                    data: encryptedData,
+                };
+            }
+            let clearPath = decryptFullFileNameZk(virtualFullPath, state.filenameObfuscationKey);
+            clearPath = normalizeRelativeUnixPath(clearPath);
+            let key = deriveContentKeyFromClearPath(clearPath, unixLastWriteTimestamp >>> 0, state);
+            let decryptedData = cryptFileBytes(encryptedData, key);
+            let keyHash4 = bufferToHex((await hash256(key)).slice(0, 4));
+            zkLog("Decrypt download payload.", {
+                virtualFullPath: virtualFullPath,
+                clearPath: clearPath,
+                bytes: toByteArray(encryptedData).byteLength,
+                unixLastWriteTimestamp: unixLastWriteTimestamp >>> 0,
+                keyHash4: keyHash4,
+                encHead16: bytesPreviewHex(encryptedData, 16),
+                clearHead16: bytesPreviewHex(decryptedData, 16),
+            });
+            return {
+                fullName: clearPath,
+                data: decryptedData,
+            };
         }
 
         async function exportCryptoKey(key) {
@@ -1836,6 +2481,22 @@
             GetStorageInfo: 18,
             GetOccupiedSpace: 19,
             GetEncryptedQR: 20,
+            GetFreeSpace: 21,
+            GetUsedSpace: 22,
+        }
+
+        const quotaStorageInfoState = {
+            freeSpace: null,
+            usedSpace: null
+        };
+
+        function alertQuotaStorageInfoIfComplete() {
+            if (quotaStorageInfoState.freeSpace === null || quotaStorageInfoState.usedSpace === null) {
+                return;
+            }
+            alertBox("used space = " + bytesToSize(quotaStorageInfoState.usedSpace) + " ; free space = " + bytesToSize(quotaStorageInfoState.freeSpace));
+            quotaStorageInfoState.freeSpace = null;
+            quotaStorageInfoState.usedSpace = null;
         }
 
         // Action that is performed when a response arrives to a command that has been sent
@@ -1844,6 +2505,7 @@
                 alertBox("The device received the public key in debug mode!");
             },
             Authentication: function (params) {
+                persistZeroKnowledgePassphraseOnSuccessfulConnection();
                 SaveClient();
                 getDir("");
             },
@@ -1880,27 +2542,68 @@
                 let error = bufferToString(params[0]);
                 alert(error);
             },
-            GetDir: function (params) {
+            GetDir: async function (params) {
                 let content = document.getElementById("content");
                 content.innerHTML = "";
-                setCloudPath(bufferToString(params[0]))
+                let clearPath = await decryptPathForUi(bufferToString(params[0]));
+                setCloudPath(clearPath);
                 document.getElementById("createDir").disabled = false;
                 document.getElementById("getFavorites").disabled = false;
                 let jsonObject = JSON.parse(bufferToString(params[1]));
-                jsonObject.forEach(addFile);
+                for (let i = 0; i < jsonObject.length; i++) {
+                    let item = jsonObject[i];
+                    item.Name = await decryptPathForUi(item.Name);
+                    let clearFullName = clearPath == "" ? item.Name : clearPath + "/" + item.Name;
+                    let unixLastWrite = 0;
+                    if (typeof item.UnixLastWriteTimestamp === "number") {
+                        unixLastWrite = item.UnixLastWriteTimestamp >>> 0;
+                    } else if (typeof item.unixLastWriteTimestamp === "number") {
+                        unixLastWrite = item.unixLastWriteTimestamp >>> 0;
+                    } else if (item.Date) {
+                        unixLastWrite = Math.floor(new Date(item.Date).getTime() / 1000) >>> 0;
+                    }
+                    fileMetadataByClearPath[clearFullName] = {
+                        unixLastWriteTimestamp: unixLastWrite,
+                        length: item.Length,
+                    };
+                    addFile(item, i);
+                }
                 updateButtonsStatus();
             },
-            GetFile: function (params, isShare) {
+            GetFile: async function (params, isShare) {
                 if (isShare === undefined) {
                     isShare = false;
                 }
                 let jsonObject = JSON.parse(bufferToString(params[0]));
                 let crc = jsonObject.Crc; // uint
-                let fullName = jsonObject.FullName; // string
-                let filename = fullName.replace(/^.*[\\\/]/, '')
+                let fullName = jsonObject.FullName; // virtual full path string
                 let dataBase64 = jsonObject.Data; // base64
                 let chunkPart = jsonObject.ChunkPart;
                 let totalChunk = jsonObject.TotalChunk;
+                let unixLastWriteTimestamp = 0;
+                if (typeof jsonObject.UnixLastWriteTimestamp === "number") {
+                    unixLastWriteTimestamp = jsonObject.UnixLastWriteTimestamp >>> 0;
+                } else if (typeof jsonObject.unixLastWriteTimestamp === "number") {
+                    unixLastWriteTimestamp = jsonObject.unixLastWriteTimestamp >>> 0;
+                }
+                let context = downloadContextByTransport[fullName];
+                if (!context) {
+                    let clearFullName = await decryptPathForUi(fullName);
+                    if (!unixLastWriteTimestamp) {
+                        let meta = fileMetadataByClearPath[clearFullName];
+                        if (meta && typeof meta.unixLastWriteTimestamp === "number") {
+                            unixLastWriteTimestamp = meta.unixLastWriteTimestamp >>> 0;
+                        }
+                    }
+                    context = {
+                        clearFullName: clearFullName,
+                        unixLastWriteTimestamp: unixLastWriteTimestamp >>> 0,
+                        isShare: isShare === true,
+                    };
+                    downloadContextByTransport[fullName] = context;
+                } else if (unixLastWriteTimestamp) {
+                    context.unixLastWriteTimestamp = unixLastWriteTimestamp >>> 0;
+                }
                 if (chunkPart == 1) {
                     download[fullName] = base64ToBuffer(dataBase64);
                 } else {
@@ -1908,12 +2611,37 @@
                 }
                 let progressBar = pendingFiles[fullName];
                 let progress = download[fullName].byteLength;
-                progressBar.set(progress)
+                if (progressBar && typeof progressBar.set === "function") {
+                    progressBar.set(progress);
+                }
                 if (chunkPart == totalChunk) {
-                    downloadArrayBuffer(filename, download[fullName], isShare);
+                    zkLog("GetFile chunk in (final).", {
+                        fullName: fullName,
+                        chunkPart: chunkPart,
+                        totalChunk: totalChunk,
+                        unixLastWriteTimestamp: context.unixLastWriteTimestamp >>> 0,
+                        totalBytes: download[fullName] ? download[fullName].byteLength : 0,
+                    });
+                    let decrypted = await decryptFileFromTransport(fullName, download[fullName], context.unixLastWriteTimestamp >>> 0);
+                    let filename = decrypted.fullName.replace(/^.*[\\\/]/, '');
+                    downloadArrayBuffer(filename, decrypted.data, context.isShare || isShare);
                     download[fullName] = null;
+                    downloadContextByTransport[fullName] = undefined;
                 } else {
-                    getFile(fullName, chunkPart + 1);
+                    if (chunkPart === 1) {
+                        zkLog("GetFile chunk in (start).", {
+                            fullName: fullName,
+                            chunkPart: chunkPart,
+                            totalChunk: totalChunk,
+                            unixLastWriteTimestamp: context.unixLastWriteTimestamp >>> 0,
+                            chunkBytes: base64ToBuffer(dataBase64).byteLength,
+                        });
+                    }
+                    if (context.isShare || isShare) {
+                        share(fullName, chunkPart + 1);
+                    } else {
+                        getFile(fullName, chunkPart + 1);
+                    }
                 }
             },
             Share: function (params) {
@@ -1933,6 +2661,8 @@
                             chunkLength[fileName] = undefined;
                             chunkParts[fileName] = undefined;
                             chunkRequest[fileName] = undefined;
+                            uploadDisplayNameByTransport[fileName] = undefined;
+                            uploadUnixTimestampByTransport[fileName] = undefined;
                         }
                     return;
                 }
@@ -1945,16 +2675,16 @@
                     upload[fullFileName] = undefined;
                     chunkLength[fullFileName] = undefined;
                     chunkParts[fullFileName] = undefined;
-                    let p = fullFileName.split("/");
-                    p = p.slice(0, p.length - 1);
-                    let path = p.join("/");
-                    getDir(path);
+                    chunkRequest[fullFileName] = undefined;
+                    uploadDisplayNameByTransport[fullFileName] = undefined;
+                    uploadUnixTimestampByTransport[fullFileName] = undefined;
+                    getDir(currentPath);
                     // } else if (upload[fullFileName] != undefined) {
                     //     // send next chunk
                     //     setFile(fullFileName, nextChunkNumber, upload[fullFileName]);
                 } else if (chunkRequest[fullFileName] != undefined) {
                     // Execute the event that asks for the next chunk to be sent
-                    chunkRequestCallback = chunkRequest[fullFileName];
+                    let chunkRequestCallback = chunkRequest[fullFileName];
                     chunkRequestCallback(fullFileName, nextChunkNumber); // Notification that it is ready to receive the next file
                 }
             },
@@ -1990,6 +2720,14 @@
                 let usedSpace = bufferToString(params[1]);
                 alertBox("used space = " + bytesToSize(usedSpace) + " ; free space = " + bytesToSize(freeSpace));
             },
+            GetFreeSpace: function (params) {
+                quotaStorageInfoState.freeSpace = bufferToInt64(params[0]);
+                alertQuotaStorageInfoIfComplete();
+            },
+            GetUsedSpace: function (params) {
+                quotaStorageInfoState.usedSpace = bufferToInt64(params[0]);
+                alertQuotaStorageInfoIfComplete();
+            },
             GetOccupiedSpace: function (params) {
                 let path = bufferToString(params[0]);
                 if (path == "") {
@@ -2022,16 +2760,99 @@
 
         }
 
-        function authentication(auth) {
-
+        async function authentication(auth) {
+            await initializeZeroKnowledgeStateFromUi();
             let pin = Number(document.getElementById("pin").value);
             let pin4 = int32ToBuffer(pin);
             let authentication = joinBuffers(auth, pin4);
-            hash256(authentication).then(hash => {
-                let verify = hash.slice(0, 4);
+            let hash = await hash256(authentication);
+            let verify = hash.slice(0, 4);
+            let zeroKnowledgeChecksum = await getZeroKnowledgeChecksum();
+            if (zeroKnowledgeChecksum) {
+                executeRequest(command.Authentication, joinBuffers(verify, zeroKnowledgeChecksum));
+            } else {
                 executeRequest(command.Authentication, verify);
-            });
+            }
         }
+
+        async function getZeroKnowledgeChecksum() {
+            let state = getZeroKnowledgeState();
+            if (state == null) {
+                return null;
+            }
+            let checksum = await hash256(state.filenameObfuscationKey);
+            return checksum.slice(0, 4);
+        }
+
+        function cleanPassphrase(passphrase) {
+            let cleaned = passphrase.replace(/\n/g, " ")
+                .replace(/\r/g, " ")
+                .replace(/,/g, "")
+                .replace(/!/g, "")
+                .replace(/\./g, "")
+                .trim();
+            cleaned = cleaned.replace(/\s+/g, " ");
+            return cleaned;
+        }
+
+        async function derivePrivateKeyFromPassphrase(passphrase) {
+            const encoder = new TextEncoder();
+            const cleaned = cleanPassphrase(passphrase);
+            const mnemonic = cleaned.normalize("NFKD");
+            const salt = "mnemonic".normalize("NFKD");
+
+            const keyMaterial = await crypto.subtle.importKey(
+                "raw",
+                encoder.encode(mnemonic),
+                "PBKDF2",
+                false,
+                ["deriveBits"]
+            );
+
+            const seed = await crypto.subtle.deriveBits(
+                {
+                    name: "PBKDF2",
+                    hash: "SHA-512",
+                    salt: encoder.encode(salt),
+                    iterations: 2048
+                },
+                keyMaterial,
+                512
+            );
+
+            const hmacKey = await crypto.subtle.importKey(
+                "raw",
+                encoder.encode("Bitcoin seed"),
+                { name: "HMAC", hash: "SHA-512" },
+                false,
+                ["sign"]
+            );
+
+            const i64 = await crypto.subtle.sign("HMAC", hmacKey, seed);
+            return i64.slice(0, 32);
+        }
+        
+        function onZeroKnowledgeToggle() {
+            let checkbox = document.getElementById("zkEnabled");
+            let container = document.getElementById("zkContainer");
+            let input = document.getElementById("zkpass");
+            if (!checkbox || !container || !input) {
+                return;
+            }
+            clearZeroKnowledgeCache();
+            if (checkbox.checked) {
+                container.style.display = "block";
+            } else {
+                input.value = "";
+                container.style.display = "none";
+            }
+        }
+
+
+        function persistZeroKnowledgePassphraseOnSuccessfulConnection() {
+            writeZkPassphraseToStorage(zkPassphrase);
+        }
+
         function setClient(rsaPubKey) {
             session.deviceKey = null; // the server will send a new encryption key
             let clientPublicKey = base64ToBuffer(session.publicKeyB64);
@@ -2041,20 +2862,80 @@
                 executeRequest(command.SetClient, clientSettingEncrypted);
             })
         }
-        function getDir(path) {
-            executeRequest(command.GetDir, path);
+        function getUnixTimestampFromDate(dateValue) {
+            if (!dateValue) {
+                return 0;
+            }
+            let ms = new Date(dateValue).getTime();
+            if (isNaN(ms)) {
+                return 0;
+            }
+            return Math.floor(ms / 1000) >>> 0;
         }
-        function getFile(fullFileName, chunkNumber) {
-            // chunkNumber is base 1 (the first chunk is number 1)
-            executeRequest(command.GetFile, fullFileName + "\t" + chunkNumber);
+        function resolveUnixTimestampForPath(clearFullName, fallbackDate) {
+            let meta = fileMetadataByClearPath[clearFullName];
+            if (meta && typeof meta.unixLastWriteTimestamp === "number") {
+                return meta.unixLastWriteTimestamp >>> 0;
+            }
+            return getUnixTimestampFromDate(fallbackDate);
         }
-        function share(fullFileName, chunkNumber) {
-            // chunkNumber is base 1 (the first chunk is number 1)
-            executeRequest(command.Share, fullFileName + "\t" + chunkNumber);
+        async function getDir(path) {
+            executeRequest(command.GetDir, await encryptPathForTransport(path));
         }
-        function setFile(fullFileName, chunkNumber, data, chunkRequestCallback) {
+        async function getFile(fullFileName, chunkNumber, metadata) {
             // chunkNumber is base 1 (the first chunk is number 1)
+            let transportFullName = fullFileName;
+            if (!downloadContextByTransport[transportFullName]) {
+                if (chunkNumber == 1 || !isEncryptedVirtualPath(fullFileName)) {
+                    transportFullName = await encryptPathForTransport(fullFileName);
+                }
+            }
+            if (chunkNumber == 1 && !downloadContextByTransport[transportFullName]) {
+                let unixLastWriteTimestamp = resolveUnixTimestampForPath(fullFileName, metadata ? metadata.date : null);
+                let maxLength = metadata && metadata.length != null ? metadata.length : 0;
+                downloadContextByTransport[transportFullName] = {
+                    clearFullName: fullFileName,
+                    unixLastWriteTimestamp: unixLastWriteTimestamp >>> 0,
+                    isShare: false,
+                };
+                if (!addProgressBar(transportFullName, maxLength, false, fullFileName)) {
+                    return;
+                }
+            }
+            executeRequest(command.GetFile, transportFullName + "\t" + chunkNumber);
+        }
+        async function share(fullFileName, chunkNumber, metadata) {
+            // chunkNumber is base 1 (the first chunk is number 1)
+            let transportFullName = fullFileName;
+            if (!downloadContextByTransport[transportFullName]) {
+                if (chunkNumber == 1 || !isEncryptedVirtualPath(fullFileName)) {
+                    transportFullName = await encryptPathForTransport(fullFileName);
+                }
+            }
+            if (chunkNumber == 1 && !downloadContextByTransport[transportFullName]) {
+                let unixLastWriteTimestamp = resolveUnixTimestampForPath(fullFileName, metadata ? metadata.date : null);
+                let maxLength = metadata && metadata.length != null ? metadata.length : 0;
+                downloadContextByTransport[transportFullName] = {
+                    clearFullName: fullFileName,
+                    unixLastWriteTimestamp: unixLastWriteTimestamp >>> 0,
+                    isShare: true,
+                };
+                if (!addProgressBar(transportFullName, maxLength, false, fullFileName)) {
+                    return;
+                }
+            }
+            executeRequest(command.Share, transportFullName + "\t" + chunkNumber);
+        }
+        function setFile(fullFileName, chunkNumber, data, chunkRequestCallback, unixLastWriteTimestamp, displayName) {
+            // chunkNumber is base 1 (the first chunk is number 1)
+            fullFileName = normalizeRelativeUnixPath(fullFileName);
             upload[fullFileName] = data;
+            if (typeof unixLastWriteTimestamp === "number") {
+                uploadUnixTimestampByTransport[fullFileName] = unixLastWriteTimestamp >>> 0;
+            }
+            if (displayName) {
+                uploadDisplayNameByTransport[fullFileName] = displayName;
+            }
             let fileLength = data.byteLength;
             let position = (chunkNumber - 1) * chunkSize;
             let toTake = fileLength - position;
@@ -2091,7 +2972,8 @@
             chunkParts[fullFileName] = parts;
             if (chunkNumber == 1) {
                 // add the progress bar
-                if (!addProgressBar(fullFileName, fileLength, true)) {
+                let progressLabel = uploadDisplayNameByTransport[fullFileName] || fullFileName;
+                if (!addProgressBar(fullFileName, fileLength, true, progressLabel)) {
                     return true; // Operation with this file already in progress
                 }
             }
@@ -2103,85 +2985,131 @@
                 ChunkPart: chunkNumber,
                 TotalChunk: parts,
             };
+            if (chunkNumber === parts) {
+                File.UnixLastWriteTimestamp = uploadUnixTimestampByTransport[fullFileName] || 0;
+            }
+            if (chunkNumber === 1 || chunkNumber === parts) {
+                zkLog("SetFile chunk out.", {
+                    fullFileName: fullFileName,
+                    chunkNumber: chunkNumber,
+                    totalChunks: parts,
+                    chunkBytes: chunkData.byteLength,
+                    unixLastWriteTimestamp: File.UnixLastWriteTimestamp >>> 0,
+                });
+            }
             executeRequest(command.SetFile, JSON.stringify(File));
             return false;
         }
-        function delete_(path, files) {
+        async function delete_(path, files) {
             if (files) {
+                path = await encryptPathForTransport(path);
                 if (Array.isArray(files)) {
+                    files = await Promise.all(files.map(file => encryptPathForTransport(file)));
                     files = files.join("\t");
+                } else {
+                    files = await encryptPathForTransport(files);
                 }
                 executeRequest(command.Delete, path + "\t" + files);
             }
         }
-        function rename(path, files, target) {
+        async function rename(path, files, target) {
             if (files) {
+                path = await encryptPathForTransport(path);
                 if (Array.isArray(files)) {
+                    files = await Promise.all(files.map(file => encryptPathForTransport(file)));
                     files = files.join("\t");
+                } else {
+                    files = await encryptPathForTransport(files);
                 }
+                target = await encryptPathForTransport(target);
                 executeRequest(command.Rename, path + "\t" + files + "\t" + target);
             }
         }
-        function move(path, files, target) {
+        async function move(path, files, target) {
             if (files) {
+                path = await encryptPathForTransport(path);
                 if (Array.isArray(files)) {
+                    files = await Promise.all(files.map(file => encryptPathForTransport(file)));
                     files = files.join("\t");
+                } else {
+                    files = await encryptPathForTransport(files);
                 }
+                target = await encryptPathForTransport(target);
                 executeRequest(command.Move, path + "\t" + files + "\t" + target);
             }
         }
-        function copy(path, files, target) {
+        async function copy(path, files, target) {
             if (files) {
+                path = await encryptPathForTransport(path);
                 if (Array.isArray(files)) {
+                    files = await Promise.all(files.map(file => encryptPathForTransport(file)));
                     files = files.join("\t");
+                } else {
+                    files = await encryptPathForTransport(files);
                 }
+                target = await encryptPathForTransport(target);
                 executeRequest(command.Copy, path + "\t" + files + "\t" + target);
             }
         }
-        function createDir(path, files) {
+        async function createDir(path, files) {
             if (files) {
+                path = await encryptPathForTransport(path);
                 if (Array.isArray(files)) {
+                    files = await Promise.all(files.map(file => encryptPathForTransport(file)));
                     files = files.join("\t");
+                } else {
+                    files = await encryptPathForTransport(files);
                 }
                 executeRequest(command.CreateDir, path + "\t" + files);
             }
         }
-        function search(path, wilscards, page, elementForPage) {
+        async function search(path, wilscards, page, elementForPage) {
             // The wildcard can be replaced by regular expressions to perform advanced searches.
             // For pagination page is the page number (zero base), and elementsForPage indicates how many results are visible for each single page (-1 = do not limit the results).
             // NOTE about case sensitive: to search for files with partial text in the name, use "TextToFind" for the casese insensitive method, instead if you don't want to take case into account, use "*TextToFind*", or use this Regex for the insensitive case: "(?i)(TextToFind)"
             if (wilscards) {
+                path = await encryptPathForTransport(path);
                 executeRequest(command.Search, path + "\t" + wilscards + "\t" + page + "\t" + elementForPage);
             }
         }
         function getGroup(groupName) {
             executeRequest(command.GetGroup, groupName);
         }
-        function addToGroup(groupname, files) {
+        async function addToGroup(groupname, files) {
             if (files) {
                 if (Array.isArray(files)) {
+                    files = await Promise.all(files.map(file => encryptPathForTransport(file)));
                     files = files.join("\t");
+                } else {
+                    files = await encryptPathForTransport(files);
                 }
                 executeRequest(command.AddToGroup, groupname + "\t" + files);
             }
         }
-        function removeFromGroup(groupname, files) {
+        async function removeFromGroup(groupname, files) {
             if (files) {
                 if (Array.isArray(files)) {
+                    files = await Promise.all(files.map(file => encryptPathForTransport(file)));
                     files = files.join("\t");
+                } else {
+                    files = await encryptPathForTransport(files);
                 }
                 executeRequest(command.RemoveFromGroup, groupname + "\t" + files);
             }
         }
         function GetStorageInfo() {
-            executeRequest(command.GetStorageInfo);
+            quotaStorageInfoState.freeSpace = null;
+            quotaStorageInfoState.usedSpace = null;
+            executeRequest(command.GetFreeSpace);
+            executeRequest(command.GetUsedSpace);
         }
-        function GetOccupiedSpace(path, wilscards) {
+        async function GetOccupiedSpace(path, wilscards) {
             // The wildcard can be replaced by regular expressions to perform advanced searches
             if (path == undefined) {
                 path = "";
             }
             if (wilscards) {
+                path = await encryptPathForTransport(path);
                 executeRequest(command.GetOccupiedSpace, path + "\t" + wilscards);
             }
         }
@@ -2226,25 +3154,27 @@
         }
         function startSendFile(file, async) {
             if (async) {
-                setTimeout(startSendFile(file, false), 1);
+                setTimeout(() => startSendFile(file, false), 1);
                 return;
             }
             let fr = new FileReader();
-            fr.onload = function () {
+            fr.onload = async function () {
                 let data = fr.result;
 
-                let fullname;
+                let clearFullName;
                 if (currentPath == "") {
-                    fullname = file.name
+                    clearFullName = file.name;
                 } else {
-                    fullname = currentPath + "/" + file.name;
+                    clearFullName = currentPath + "/" + file.name;
                 }
+                let unixLastWriteTimestamp = Math.floor((file.lastModified || Date.now()) / 1000) >>> 0;
+                let encrypted = await encryptFileForTransport(clearFullName, data, unixLastWriteTimestamp);
                 function chunkRequestCallback(fullFileName, numberOfChunksRequested) {
                     // This function will be called as an event when the system requests to send the next chunk
                     // Function that is called to ask for the following chunk
                     setFile(fullFileName, numberOfChunksRequested, upload[fullFileName]);
                 }
-                setFile(fullname, 1, data, chunkRequestCallback)
+                setFile(encrypted.fullName, 1, encrypted.data, chunkRequestCallback, encrypted.unixLastWriteTimestamp, clearFullName);
                 //setFile(currentPath + "/" + file.name, 1, data)
             };
             fr.readAsArrayBuffer(file);
@@ -2275,7 +3205,7 @@
 
     <!--functions to dynamically add HTML elements to the page-->
     <script>
-        function addProgressBar(text, max, isUplload) {
+        function addProgressBar(text, max, isUplload, labelText) {
             if (pendingFiles[text] == undefined || pendingFiles[text] == null) {
                 let container = document.createElement("container");
                 pendingFiles[text] = container;
@@ -2285,12 +3215,12 @@
                 }
                 let label = document.createElement("label");
                 label.for = text;
-                label.innerText = ico + text;
+                label.innerText = ico + (labelText || text);
                 let progressBar = document.createElement("progress");
                 container.appendChild(label);
                 container.appendChild(progressBar);
                 progressBar.id = text;
-                progressBar.max = max;
+                progressBar.max = max > 0 ? max : 1;
                 progressBar.value = 0;
                 progressBar.className = "progressBar";
                 let topBar = document.getElementById("topBar");
@@ -2306,7 +3236,7 @@
                     //percentage = round((value / max) * 100);
                     //bar.style.width = percentage + "%";
                     progressBar.value = value;
-                    if (value == progressBar.max) {
+                    if (value >= progressBar.max) {
                         container.remove();
                     }
                     else {
@@ -2326,6 +3256,17 @@
                 parent.removeChild(parent.firstChild);
             }
         }
+
+        function getParentCloudPath(path) {
+            path = normalizeRelativeUnixPath(path);
+            if (path === "") {
+                return "";
+            }
+            let parts = path.split("/");
+            parts.pop();
+            return parts.join("/");
+        }
+
         function addFile(file, idx) {
             let content = document.getElementById("content");
             if (idx == 0) {
@@ -2346,23 +3287,28 @@
 
             if (file.IsDirectory) {
                 fileItemBox.onclick = function (event) {
-                    getDir(currentPath + "/" + file.Name);
+                    if (file.Name === "..") {
+                        getDir(getParentCloudPath(currentPath));
+                    } else {
+                        getDir(currentPath == "" ? file.Name : currentPath + "/" + file.Name);
+                    }
                 }
             } else {
                 fileItemBox.onclick = function (event) {
                     let fullname;
                     if (currentPath == "") {
-                        fullname = file.Name
+                        fullname = file.Name;
                     } else {
                         fullname = currentPath + "/" + file.Name;
                     }
-                    if (!addProgressBar(fullname, file.Length, false)) {
-                        return; // Operation with this file already in progress
-                    }
+                    let metadata = {
+                        length: file.Length,
+                        date: file.Date,
+                    };
                     if (event.shiftKey || event.ctrlKey || event.altKey) {
-                        share(fullname, 1);
+                        share(fullname, 1, metadata);
                     } else {
-                        getFile(fullname, 1);
+                        getFile(fullname, 1, metadata);
                     }
                 }
             }
@@ -2627,10 +3573,10 @@
             } else if (ep.indexOf(".") == -1) {
                 ep = ep + ".tc0.it";
             }
-            let json = await resolveDNS(ep);
-            if (json.Answer && json.Answer.length > 0) {
-                ep = json.Answer[0].data;
-            }
+            // let json = await resolveDNS(ep);
+            // if (json.Answer && json.Answer.length > 0) {
+            //     ep = json.Answer[0].data;
+            // }
             if (!ep.startsWith("http")) {
                 ep = "http://" + ep;
             }
@@ -2709,6 +3655,10 @@
         var currentGroup = null;
         var download = [];
         var upload = [];
+        var fileMetadataByClearPath = [];
+        var downloadContextByTransport = [];
+        var uploadDisplayNameByTransport = [];
+        var uploadUnixTimestampByTransport = [];
         var chunkLength = [];
         var chunkParts = [];
         var chunkRequest = [];
@@ -2732,19 +3682,21 @@
         if (isDebug) {
             proxy = "https://localhost:7060";
         }
-
         let reset = false;
-        if (reset) {
-            DeleteClient(); // Logout and delete current client account == LOGOUT ==
-        } else {
-            // Load last Client if exist, in order to remain logged in the previous session
-            // NOTE: In production this function must be protected by a pin, or the application must ask for a pin at startup
-            LoadClient(0).then(loaded => {
+        (async function initializeApp() {
+            await initializeZeroKnowledgeStateFromStorage();
+            if (reset) {
+                await DeleteClient(); // Logout and delete current client account == LOGOUT ==
+            } else {
+                // Load last Client if exist, in order to remain logged in the previous session
+                // NOTE: In production this function must be protected by a pin, or the application must ask for a pin at startup
+                let loaded = await LoadClient(0);
                 if (!loaded) {
-                    NewSession(); // If a saved session was not found, create a new one
+                    await NewSession(); // If a saved session was not found, create a new one
                 }
-            })
-        }
+            }
+        })();
+
     </script>
 
     <style>
@@ -3025,6 +3977,15 @@
                     <label for="pin">Pin</label>
                     <!--<input id="pin" type="password" value="">-->
                     <input id="pin" type="password" value="">
+                    <div>
+                        <input id="zkEnabled" type="checkbox" onchange="onZeroKnowledgeToggle()">
+                        <label for="zkEnabled">I enabled zero knowledge encryption while creating my account.</label>
+                    </div>
+                    <div id="zkContainer" style="display:none;">
+                        <label for="zkpass">Zero knowledge passphrase</label>
+                        <textarea id="zkpass" rows="3" style="width:100%;"></textarea>
+                    </div>
+                    <br />
                     <!--The server has protection against brute force attacks, it is not allowed to make attempts in less than 5 seconds, so you must disable the button this period or more-->
                     <button type="button" id="connect" onclick="this.disabled = true; setTimeout(() => this.disabled = false, 30000) // 30 sec. is the timeout on proxy site for answare;
                         ; onQrCodeAcquires(document.getElementById('qr').value);"

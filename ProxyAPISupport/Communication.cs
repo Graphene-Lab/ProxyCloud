@@ -46,7 +46,7 @@ namespace ProxyAPISupport
             if (IsInitialized)
                 return false;
 
-            if (DafaultEntryLocalPoint == LocalEntryPoint.Pipe)
+            if (DefaultEntryLocalPoint == LocalEntryPoint.Pipe)
             {
                 entryPoint ??= "pipe://router";
             }
@@ -61,7 +61,7 @@ namespace ProxyAPISupport
             return true;
         }
 
-        public static LocalEntryPoint DafaultEntryLocalPoint = LocalEntryPoint.LocalhostTcp;
+        public static LocalEntryPoint DefaultEntryLocalPoint = LocalEntryPoint.LocalhostTcp;
 
         public enum LocalEntryPoint
         {

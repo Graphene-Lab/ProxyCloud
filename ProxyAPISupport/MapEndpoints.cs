@@ -26,7 +26,7 @@ namespace ProxyAPISupport
             }
             else if (context.Request.Query.TryGetValue("qr", out var _))
             {
-                var browserUrl = "https://raw.githubusercontent.com/Andrea-Bruno/ProxyCloud/master/ClientHtml/CryptoCloudClientWeb.html";
+                var browserUrl = "https://raw.githubusercontent.com/Graphene-Lab/ProxyCloud/master/ClientHtml/CryptoCloudClientWeb.html";
                 var wc = new WebClient();
                 string html = wc.DownloadString(browserUrl);
                 await context.Response.WriteAsync(html);

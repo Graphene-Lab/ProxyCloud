@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <Description>Library that allows a web application to become a proxy for encrypted communication with the cloud via the API</Description>
     <Configurations>Debug;Release</Configurations>
   </PropertyGroup>

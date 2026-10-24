@@ -3423,7 +3423,8 @@
                 let target = document.getElementById("target");
                 target.files = files;
                 target.sourcePath = currentPath;
-                target.command = command.Move;
+                // button.command is a browser-defined string property, not our numeric command ID.
+                target.fileOperationCommand = command.Move;
                 goToTarget(true);
             }
         }
@@ -3434,7 +3435,7 @@
                 let target = document.getElementById("target");
                 target.files = files;
                 target.sourcePath = currentPath;
-                target.command = command.Copy;
+                target.fileOperationCommand = command.Copy;
                 goToTarget(true);
             }
         }
@@ -3475,10 +3476,10 @@
         function onTargetButton(event) {
             let target = event.target;
             if (target.files != null && target.files.length != 0) {
-                if (target.command == command.Move && target.sourcePath != currentPath) {
+                if (target.fileOperationCommand == command.Move && target.sourcePath != currentPath) {
                     move(target.sourcePath, target.files, currentPath);
                 }
-                else if (target.command == command.Copy) {
+                else if (target.fileOperationCommand == command.Copy) {
                     let paste = currentPath;
                     if (target.sourcePath == currentPath && target.files.length == 1) {
                         paste = window.prompt("Enter a name of copy", "copy_" + files[0]);

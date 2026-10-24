@@ -1057,6 +1057,8 @@
             if (zkCheckbox) {
                 zkCheckbox.checked = false;
             }
+            zeroKnowledgeEnabled = false;
+            goToTarget();
         }
     }
 
@@ -1478,6 +1480,13 @@
             state: null,
         };
         let zkPassphrase = "";
+        // Keep the account mode after directory browsing replaces the login controls.
+        let zeroKnowledgeEnabled = false;
+
+        function isZeroKnowledgeModeEnabled() {
+            let checkbox = document.getElementById("zkEnabled");
+            return checkbox ? checkbox.checked : zeroKnowledgeEnabled;
+        }
 
         function zkLog() {
             let args = Array.from(arguments);
@@ -1520,6 +1529,7 @@
 
         async function initializeZeroKnowledgeStateFromStorage() {
             setZeroKnowledgePassphrase(readZkPassphraseFromStorage());
+            zeroKnowledgeEnabled = shouldUseZeroKnowledge();
             await initializeZeroKnowledgeState();
         }
 
@@ -1527,6 +1537,7 @@
             let checkbox = document.getElementById("zkEnabled");
             let input = document.getElementById("zkpass");
             if (!!checkbox && !!input) {
+                zeroKnowledgeEnabled = checkbox.checked === true;
                 setZeroKnowledgePassphrase(checkbox.checked === true ? (input.value || "") : "");
             }
             await initializeZeroKnowledgeState();
@@ -2839,6 +2850,8 @@
             if (!checkbox || !container || !input) {
                 return;
             }
+            zeroKnowledgeEnabled = checkbox.checked === true;
+            goToTarget();
             clearZeroKnowledgeCache();
             if (checkbox.checked) {
                 container.style.display = "block";
@@ -3491,11 +3504,13 @@
             goToTarget(false);
         }
 
-        function goToTarget(startGoTo) {
+        // Delete retains the existing selection/destination state when only ZK mode changes.
+        function goToTarget(startGoTo = document.getElementById("delete").disabled) {
+            let restricted = isZeroKnowledgeModeEnabled();
             document.getElementById("delete").disabled = startGoTo;
-            document.getElementById("rename").disabled = startGoTo;
-            document.getElementById("move").disabled = startGoTo;
-            document.getElementById("copy").disabled = startGoTo;
+            document.getElementById("rename").disabled = startGoTo || restricted;
+            document.getElementById("move").disabled = startGoTo || restricted;
+            document.getElementById("copy").disabled = startGoTo || restricted;
             let addFav = startGoTo;
             if (currentGroup) {
                 addFav = true;
@@ -3506,7 +3521,10 @@
                 removeFav = true;
             }
             document.getElementById("removeFromFavorites").disabled = removeFav;
-            document.getElementById("target").disabled = !target.files;
+            let target = document.getElementById("target");
+            target.disabled = !target.files || restricted;
+            document.getElementById("zkFileOperationsNotice").hidden = !restricted;
+            document.getElementById("bottom").classList.toggle("zkPathChangesRestricted", restricted);
         }
 
         function updateButtonsStatus() {
@@ -3684,6 +3702,13 @@
             proxy = "https://localhost:7060";
         }
         let reset = false;
+        document.addEventListener("DOMContentLoaded", function () {
+            let checkbox = document.getElementById("zkEnabled");
+            if (checkbox) {
+                checkbox.checked = zeroKnowledgeEnabled;
+            }
+            goToTarget();
+        });
         (async function initializeApp() {
             await initializeZeroKnowledgeStateFromStorage();
             if (reset) {
@@ -3905,6 +3930,18 @@
             box-shadow: rgba(0, 0, 0, 0.2) 0px 10px 20px, rgba(0, 0, 0, 0.3) 0px 6px 6px;
         }
 
+        .bottom.zkPathChangesRestricted {
+            flex-wrap: wrap;
+            height: auto;
+            min-height: 140px;
+            gap: 12px 0;
+        }
+
+        #zkFileOperationsNotice {
+            flex-basis: 100%;
+            margin: 0;
+        }
+
         .functionButton {
             margin-left: 20px;
             font-size: xx-small;
@@ -4029,6 +4066,7 @@
                 </div>
             </section>
             <section id="bottom" class="bottom" ondrop="dropHandler(event);">
+                <p id="zkFileOperationsNotice" role="status" hidden>Rename, Move and Copy are temporarily unavailable to protect files encrypted with zero-knowledge encryption.</p>
                 <button disabled id="delete" class="functionButton" onclick="onDeleteButton();"
                     title="Delete">Delete</button>
                 <button disabled id="rename" class="functionButton" onclick="onRenameButton();"

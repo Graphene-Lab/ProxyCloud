@@ -3482,7 +3482,7 @@
                 else if (target.fileOperationCommand == command.Copy) {
                     let paste = currentPath;
                     if (target.sourcePath == currentPath && target.files.length == 1) {
-                        paste = window.prompt("Enter a name of copy", "copy_" + files[0]);
+                        paste = window.prompt("Enter a name of copy", "copy_" + target.files[0]);
                     }
                     copy(target.sourcePath, target.files, paste);
                 }

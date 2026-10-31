@@ -2330,8 +2330,9 @@
         const maxConcurentRequest = 2;
         var concurentRequest = 0;
         const spooler = [];
-        function executeRequest(commandId, data) {
-            spooler.push([commandId, data]);
+        var activeRequests = Object.create(null);
+        function executeRequest(commandId, data, options) {
+            spooler.push([commandId, data, options || null]);
             spoolingRequest();
         }
         function requestDone() {
@@ -2340,97 +2341,154 @@
                 spoolingRequest();
             }
         }
+        function releaseActiveRequest(options, request) {
+            if (options && options.requestKey && activeRequests[options.requestKey] === request) {
+                activeRequests[options.requestKey] = null;
+            }
+        }
 
         function spoolingRequest() {
-            if (concurentRequest < maxConcurentRequest) {
-                concurentRequest++;
-                /*try {*/
-                let toProcessing = spooler[spooler.length - 1];
-                spooler.pop();
-                let commandId = toProcessing[0];
-                let data = toProcessing[1];
-                //function executeRequest(commandId, data) {
-                if (commandId == null) {
-                    debugger;
-                    console.log("Command does not exist");
-                }
-                if (!data) {
-                    data = "";
-                }
-                if (typeof data === 'string') {
-                    data = stringToBuffer(data);
-                }
-                let get = commandId == command.GetPushNotifications;
-                let url = proxy + "/data?cid=" + encodeURIComponent(session.clientId);
-                let purpose;
-                if (commandId == command.SetClient || commandId == command.GetEncryptedQR) {
-                    url += "&sid=" + encodeURIComponent(session.serverId);
-                    purpose = getCommandName(commandId);
-                    url += "&purpose=" + purpose; // SetClient Parameter is used only in debug that indicates whether a public encryption key is sent to the device. In releise the key is never sent it must be scanned by QR code
-                }
-                function onResponseError() {
-                    debugger; //if status is 0, enable CORS in the server side: https://learn.microsoft.com/en-us/aspnet/core/security/cors?view=aspnetcore-6.0
-                    alertBox("HTTP Request error " + this.status);
-                    requestDone();
-                }
-
-                let request = new XMLHttpRequest();
-                request.open(get ? "GET" : "POST", url);
-                request.onerror = onResponseError;
-                request.onabort = onResponseError;
-                request.ontimeout = onResponseError;
-                request.onload = function () {
-                    requestDone();
-                    if (this.status == 404) {
-                        alertBox("status 404 = cloud not found by sid: No cloud with this User ID has registered in the proxy");
-                    }
-                    else if (this.status == 503) {
-                        alertBox("status 503 = Max request concurent");
-                    }
-                    else if (this.status == 421) {
-                        alertBox("status 421 = the cloud is not logged into the proxy, please restart it");
-                    } else if (this.readyState == this.DONE && this.status == 200 && this.responseText != "") {
-                        if (session.QRkey) {
-                            onCommandResponse.GetEncryptedQR(this.responseText);
-                        } else if (session.deviceKey || session.encryptionType) {
-                            // Use the generated key sent by the server
-                            decryptResponse(this.responseText).then(decrypted => {
-                                onResponse(decrypted);
-                            });
-                        } else {
-                            // Use encryption with keys generated on the client
-                            asymmetricalDecrypt(this.responseText).then(decrypted => {
-                                onResponse(decrypted);
-                            });
-                        };
-                    };
-                }
-                if (purpose) {
-                    request.send(data);
-                }
-                else if (get) {
-                    request.send();
-                }
-                else {
-                    if (data == null) {
-                        data = int32ToBuffer(commandId);
-                    } else {
-                        cmd = int32ToBuffer(commandId);
-                        data = joinBuffers(cmd, data);
-                    }
-                    if (session == null || session.deviceKey == null) {
-                        alertBox("Unregistered user. You need to log in to the server to initialize the encryption.");
-                    } else {
-                        encryptDataForTheDevice(data).then(encrypted => {
-                            request.send(encrypted);
-                        });
-                    }
-                }
-
-                //} catch (e) {
-                //    concurentRequest--;
-                //}
+            if (concurentRequest >= maxConcurentRequest || spooler.length === 0) {
+                return;
             }
+            let toProcessing = spooler.pop();
+            let commandId = toProcessing[0];
+            let data = toProcessing[1];
+            let options = toProcessing[2];
+            if (options && typeof options.shouldAbort === "function" && options.shouldAbort()) {
+                // A canceled upload can leave its already-spooled chunk behind.
+                // Discard it instead of sending a chunk after cancellation.
+                spoolingRequest();
+                return;
+            }
+            concurentRequest++;
+            /*try {*/
+            //function executeRequest(commandId, data) {
+            if (commandId == null) {
+                debugger;
+                console.log("Command does not exist");
+            }
+            if (!data) {
+                data = "";
+            }
+            if (typeof data === 'string') {
+                data = stringToBuffer(data);
+            }
+            let get = commandId == command.GetPushNotifications;
+            let url = proxy + "/data?cid=" + encodeURIComponent(session.clientId);
+            let purpose;
+            if (commandId == command.SetClient || commandId == command.GetEncryptedQR) {
+                url += "&sid=" + encodeURIComponent(session.serverId);
+                purpose = getCommandName(commandId);
+                url += "&purpose=" + purpose; // SetClient Parameter is used only in debug that indicates whether a public encryption key is sent to the device. In releise the key is never sent it must be scanned by QR code
+            }
+            function reportRequestError(error) {
+                if (options && typeof options.onError === "function") {
+                    options.onError(error);
+                } else if (!error.aborted) {
+                    //if status is 0, enable CORS in the server side: https://learn.microsoft.com/en-us/aspnet/core/security/cors?view=aspnetcore-6.0
+                    alertBox("HTTP Request error " + error.status);
+                }
+            }
+            function onResponseError() {
+                releaseActiveRequest(options, request);
+                requestDone();
+                reportRequestError({status: this.status || 0, aborted: false});
+            }
+            function onAbort() {
+                releaseActiveRequest(options, request);
+                requestDone();
+                reportRequestError({status: this.status || 0, aborted: true});
+            }
+
+            let request = new XMLHttpRequest();
+            if (options && options.requestKey) {
+                activeRequests[options.requestKey] = request;
+            }
+            request.open(get ? "GET" : "POST", url);
+            if (request.upload && options && typeof options.onUploadProgress === "function") {
+                request.upload.onprogress = function (event) {
+                    if (event.lengthComputable) {
+                        options.onUploadProgress(event.loaded, event.total);
+                    }
+                };
+            }
+            request.onerror = onResponseError;
+            request.onabort = onAbort;
+            request.ontimeout = onResponseError;
+            request.onload = function () {
+                releaseActiveRequest(options, request);
+                requestDone();
+                if (options && typeof options.onError === "function" && this.status != 200) {
+                    options.onError({status: this.status, aborted: false});
+                    return;
+                }
+                if (this.status == 404) {
+                    alertBox("status 404 = cloud not found by sid: No cloud with this User ID has registered in the proxy");
+                }
+                else if (this.status == 503) {
+                    alertBox("status 503 = Max request concurent");
+                }
+                else if (this.status == 421) {
+                    alertBox("status 421 = the cloud is not logged into the proxy, please restart it");
+                } else if (this.readyState == this.DONE && this.status == 200 && this.responseText != "") {
+                    let decryptPromise = null;
+                    if (session.QRkey) {
+                        onCommandResponse.GetEncryptedQR(this.responseText);
+                    } else if (session.deviceKey || session.encryptionType) {
+                        // Use the generated key sent by the server
+                        decryptPromise = decryptResponse(this.responseText).then(decrypted => {
+                            onResponse(decrypted);
+                        });
+                    } else {
+                        // Use encryption with keys generated on the client
+                        decryptPromise = asymmetricalDecrypt(this.responseText).then(decrypted => {
+                            onResponse(decrypted);
+                        });
+                    };
+                    if (decryptPromise && options && typeof options.onError === "function") {
+                        // Only upload requests opt into response-decryption error handling.
+                        decryptPromise.catch(error => options.onError({status: this.status, error: error}));
+                    }
+                } else if (options && options.requireResponse && typeof options.onError === "function") {
+                    options.onError({status: this.status, aborted: false, emptyResponse: true});
+                }
+            }
+            if (purpose) {
+                request.send(data);
+            }
+            else if (get) {
+                request.send();
+            }
+            else {
+                if (data == null) {
+                    data = int32ToBuffer(commandId);
+                } else {
+                    cmd = int32ToBuffer(commandId);
+                    data = joinBuffers(cmd, data);
+                }
+                if (session == null || session.deviceKey == null) {
+                    alertBox("Unregistered user. You need to log in to the server to initialize the encryption.");
+                } else {
+                    encryptDataForTheDevice(data).then(encrypted => {
+                        try {
+                            request.send(encrypted);
+                        } catch (e) {
+                            releaseActiveRequest(options, request);
+                            requestDone();
+                            reportRequestError({status: 0, aborted: false, error: e});
+                        }
+                    }).catch(error => {
+                        releaseActiveRequest(options, request);
+                        requestDone();
+                        reportRequestError({status: 0, aborted: false, error: error});
+                    });
+                }
+            }
+
+            //} catch (e) {
+            //    concurentRequest--;
+            //}
         }
 
         function onResponse(binary) {

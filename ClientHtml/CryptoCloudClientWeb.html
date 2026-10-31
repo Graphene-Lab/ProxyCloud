@@ -2453,12 +2453,12 @@
                     } else if (session.deviceKey || session.encryptionType) {
                         // Use the generated key sent by the server
                         decryptPromise = decryptResponse(this.responseText).then(decrypted => {
-                            onResponse(decrypted);
+                            onResponse(decrypted, options);
                         });
                     } else {
                         // Use encryption with keys generated on the client
                         decryptPromise = asymmetricalDecrypt(this.responseText).then(decrypted => {
-                            onResponse(decrypted);
+                            onResponse(decrypted, options);
                         });
                     };
                     if (decryptPromise && options && typeof options.onError === "function") {
@@ -2506,12 +2506,18 @@
             //}
         }
 
-        function onResponse(binary) {
+        function onResponse(binary, options) {
             let commandId = bufferToInt(binary.slice(0, 4));
             let command = getCommandName(commandId);
             let data = binary.slice(4);
             let params = splitData(data);
-            eval("onCommandResponse." + command + "(params)");
+            if (options && typeof options.onResponse === "function") {
+                // Awaited operations (for example folder creation) receive the
+                // response for their own request instead of the global dispatch.
+                options.onResponse(commandId, params);
+            } else {
+                eval("onCommandResponse." + command + "(params)");
+            }
             //eval("onCommandResponse." + command).call(params);
             //  window["onCommandResponse." + command](params);
         }
@@ -2660,12 +2666,22 @@
                 }
             },
             GetDir: async function (params) {
+                let selection = getSelectedFileNames();
                 let content = document.getElementById("content");
                 content.innerHTML = "";
                 let clearPath = await decryptPathForUi(bufferToString(params[0]));
                 setCloudPath(clearPath);
                 document.getElementById("createDir").disabled = false;
                 document.getElementById("getFavorites").disabled = false;
+                let uploadsDisabled = !!currentGroup;
+                let uploadFilesButton = document.getElementById("uploadFilesButton");
+                if (uploadFilesButton) {
+                    uploadFilesButton.disabled = uploadsDisabled;
+                }
+                let uploadFolderButton = document.getElementById("uploadFolderButton");
+                if (uploadFolderButton) {
+                    uploadFolderButton.disabled = uploadsDisabled;
+                }
                 let jsonObject = JSON.parse(bufferToString(params[1]));
                 for (let i = 0; i < jsonObject.length; i++) {
                     let item = jsonObject[i];
@@ -2685,6 +2701,7 @@
                     };
                     addFile(item, i);
                 }
+                restoreSelectedFileNames(selection, clearPath);
                 updateButtonsStatus();
             },
             GetFile: async function (params, isShare) {
@@ -3099,7 +3116,12 @@
             if (session.progress) {
                 session.progress.complete();
             }
-            getDir(currentPath);
+            if (typeof session.resolveFinished === "function") {
+                session.resolveFinished({ status: "completed" });
+            }
+            if (!session.deferRefresh) {
+                getDir(currentPath);
+            }
         }
 
         function failUpload(session, message) {
@@ -3116,7 +3138,13 @@
             if (session.progress) {
                 session.progress.fail();
             }
-            if (message) {
+            if (typeof session.resolveFinished === "function") {
+                session.resolveFinished({
+                    status: session.cancelRequested ? "cancelled" : "failed",
+                    message: message || "",
+                });
+            }
+            if (message && !session.suppressFailureAlert) {
                 alertBox(message);
             }
         }
@@ -3129,6 +3157,9 @@
                     failUpload(session, null);
                 }
             }
+            if (typeof cancelPendingUploadBatches === "function") {
+                cancelPendingUploadBatches();
+            }
             if (message) {
                 alertBox(message);
             }
@@ -3139,6 +3170,7 @@
             if (!session) {
                 return;
             }
+            session.cancelRequested = true;
             failUpload(session, "Upload canceled: " + (session.clearFullName || transportName));
         }
 
@@ -3315,7 +3347,7 @@
                 executeRequest(command.Copy, path + "\t" + files + "\t" + target);
             }
         }
-        async function createDir(path, files) {
+        async function createDir(path, files, requestOptions) {
             if (files) {
                 path = await encryptPathForTransport(path);
                 if (Array.isArray(files)) {
@@ -3324,8 +3356,43 @@
                 } else {
                     files = await encryptPathForTransport(files);
                 }
-                executeRequest(command.CreateDir, path + "\t" + files);
+                executeRequest(command.CreateDir, path + "\t" + files, requestOptions);
             }
+        }
+        function createDirAndWait(path, files) {
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                let timer = setTimeout(function () {
+                    finish(reject, new Error("Timed out while creating the destination folder. Check the cloud connection and try again."));
+                }, 30000);
+                function finish(callback, value) {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    clearTimeout(timer);
+                    callback(value);
+                }
+                createDir(path, files, {
+                    requireResponse: true,
+                    onResponse: function (responseCommandId, params) {
+                        if (responseCommandId === command.CreateDir) {
+                            finish(resolve, params);
+                        } else if (responseCommandId === command.Error) {
+                            let message = params && params[0] ? bufferToString(params[0]) : "unknown server error";
+                            finish(reject, new Error("Could not create the destination folder: " + message));
+                        } else {
+                            finish(reject, new Error("Unexpected response while creating the destination folder."));
+                        }
+                    },
+                    onError: function (error) {
+                        let reason = error && error.status ? "HTTP " + error.status : "network error";
+                        finish(reject, new Error("Could not create the destination folder (" + reason + ")."));
+                    }
+                }).catch(function (error) {
+                    finish(reject, error);
+                });
+            });
         }
         async function search(path, wilscards, page, elementForPage) {
             // The wildcard can be replaced by regular expressions to perform advanced searches.
@@ -3393,48 +3460,785 @@
 
     <!--functions that are triggered by the user-->
     <script>
-        function dropHandler(ev) {
-            console.log('File(s) dropped');
-            // Prevent default behavior (Prevent file from being opened)
-            ev.preventDefault();
-            if (ev.dataTransfer.items) {
-                // Use DataTransferItemList interface to access the file(s)
-                for (let i = 0; i < ev.dataTransfer.items.length; i++) {
-                    // If dropped items aren't files, reject them
-                    if (ev.dataTransfer.items[i].kind === 'file') {
-                        let file = ev.dataTransfer.items[i].getAsFile();
-                        console.log('... file[' + i + '].name = ' + file.name);
-                        startSendFile(file, true);
+        function canUploadToCurrentPath() {
+            if (!session || session.deviceKey == null) {
+                alertBox("Connect to your cloud before uploading.");
+                return false;
+            }
+            if (currentGroup) {
+                alertBox("Uploads are not available in this view. Open a folder first.");
+                return false;
+            }
+            return true;
+        }
+
+        function joinCloudPath(basePath, relativePath) {
+            let base = normalizeRelativeUnixPath(basePath);
+            let relative = normalizeRelativeUnixPath(relativePath);
+            if (!base) {
+                return relative;
+            }
+            if (!relative) {
+                return base;
+            }
+            return base + "/" + relative;
+        }
+
+        function addParentDirectories(relativePath, target) {
+            let parts = normalizeRelativeUnixPath(relativePath).split("/");
+            parts.pop();
+            let current = "";
+            for (let i = 0; i < parts.length; i++) {
+                if (!parts[i]) {
+                    continue;
+                }
+                current = current === "" ? parts[i] : current + "/" + parts[i];
+                target.add(current);
+            }
+        }
+
+        function collectUploadDirectories(files, extraDirectories) {
+            let directories = new Set();
+            for (let i = 0; i < (extraDirectories || []).length; i++) {
+                let normalized = normalizeRelativeUnixPath(extraDirectories[i]);
+                if (normalized) {
+                    directories.add(normalized);
+                }
+            }
+            for (let i = 0; i < (files || []).length; i++) {
+                let item = files[i];
+                if (item && item.relativePath) {
+                    addParentDirectories(item.relativePath, directories);
+                }
+            }
+            let currentDirectories = Array.from(directories);
+            for (let i = 0; i < currentDirectories.length; i++) {
+                let parts = currentDirectories[i].split("/");
+                let current = "";
+                for (let partIndex = 0; partIndex < parts.length - 1; partIndex++) {
+                    if (!parts[partIndex]) {
+                        continue;
+                    }
+                    current = current === "" ? parts[partIndex] : current + "/" + parts[partIndex];
+                    directories.add(current);
+                }
+            }
+            return directories;
+        }
+
+        function groupUploadDirectories(directories) {
+            let groups = new Map();
+            directories.forEach(function (directory) {
+                let normalized = normalizeRelativeUnixPath(directory);
+                if (!normalized) {
+                    return;
+                }
+                let slash = normalized.lastIndexOf("/");
+                let parent = slash < 0 ? "" : normalized.substring(0, slash);
+                let name = normalized.substring(slash + 1);
+                if (!name) {
+                    return;
+                }
+                if (!groups.has(parent)) {
+                    groups.set(parent, new Set());
+                }
+                groups.get(parent).add(name);
+            });
+            let result = [];
+            groups.forEach(function (names, parent) {
+                result.push({ parent: parent, names: Array.from(names).sort() });
+            });
+            result.sort(function (a, b) {
+                let depthA = a.parent === "" ? 0 : a.parent.split("/").length;
+                let depthB = b.parent === "" ? 0 : b.parent.split("/").length;
+                if (depthA !== depthB) {
+                    return depthA - depthB;
+                }
+                return a.parent.localeCompare(b.parent);
+            });
+            return result;
+        }
+
+        async function ensureUploadDirectories(basePath, directories) {
+            let groups = groupUploadDirectories(directories);
+            for (let i = 0; i < groups.length; i++) {
+                if (uploadBatchCancelled) {
+                    return;
+                }
+                let group = groups[i];
+                await createDirAndWait(joinCloudPath(basePath, group.parent), group.names);
+            }
+        }
+
+        function readAllDirectoryEntries(reader) {
+            return new Promise(function (resolve, reject) {
+                let all = [];
+                function readNext() {
+                    try {
+                        reader.readEntries(function (entries) {
+                            if (!entries || entries.length === 0) {
+                                resolve(all);
+                                return;
+                            }
+                            for (let i = 0; i < entries.length; i++) {
+                                all.push(entries[i]);
+                            }
+                            readNext();
+                        }, function (error) {
+                            reject(error || new Error("Could not read the dropped folder."));
+                        });
+                    } catch (error) {
+                        reject(error);
                     }
                 }
-            } else {
-                // Use DataTransfer interface to access the file(s)
-                for (let i = 0; i < ev.dataTransfer.files.length; i++) {
-                    let file = ev.dataTransfer.files[i];
-                    console.log('... file[' + i + '].name = ' + file.name);
-                    startSendFile(file, true);
+                readNext();
+            });
+        }
+
+        function readDroppedFile(entry) {
+            return new Promise(function (resolve, reject) {
+                try {
+                    entry.file(resolve, reject);
+                } catch (error) {
+                    reject(error);
+                }
+            });
+        }
+
+        async function walkDroppedEntry(entry, relativePath, batch) {
+            if (!entry) {
+                return;
+            }
+            relativePath = normalizeRelativeUnixPath(relativePath);
+            if (!relativePath) {
+                return;
+            }
+            if (entry.isFile) {
+                try {
+                    let file = await readDroppedFile(entry);
+                    if (file) {
+                        batch.files.push({ file: file, relativePath: relativePath });
+                    }
+                } catch (error) {
+                    console.warn("Could not read a dropped file.", error);
+                }
+                return;
+            }
+            if (entry.isDirectory) {
+                batch.directories.push(relativePath);
+                let children;
+                try {
+                    children = await readAllDirectoryEntries(entry.createReader());
+                } catch (error) {
+                    console.warn("Could not read a dropped directory.", error);
+                    return;
+                }
+                for (let i = 0; i < children.length; i++) {
+                    let child = children[i];
+                    if (!child || !child.name) {
+                        continue;
+                    }
+                    await walkDroppedEntry(child, relativePath + "/" + child.name, batch);
                 }
             }
         }
-        async function startSendFile(file, defer) {
-            if (defer) {
-                setTimeout(() => startSendFile(file, false), 1);
+
+        function snapshotDroppedItems(dataTransfer) {
+            let snapshot = { entries: [], files: [], skipped: 0 };
+            let items = dataTransfer && dataTransfer.items;
+            if (items && items.length) {
+                for (let i = 0; i < items.length; i++) {
+                    let item = items[i];
+                    if (!item || item.kind !== "file") {
+                        continue;
+                    }
+                    let entry = null;
+                    try {
+                        if (typeof item.webkitGetAsEntry === "function") {
+                            entry = item.webkitGetAsEntry();
+                        }
+                    } catch (error) {
+                        entry = null;
+                    }
+                    if (entry) {
+                        snapshot.entries.push(entry);
+                        continue;
+                    }
+                    let file = null;
+                    try {
+                        if (typeof item.getAsFile === "function") {
+                            file = item.getAsFile();
+                        }
+                    } catch (error) {
+                        file = null;
+                    }
+                    if (file) {
+                        snapshot.files.push({
+                            file: file,
+                            relativePath: normalizeRelativeUnixPath(file.webkitRelativePath || file.name),
+                        });
+                    } else {
+                        snapshot.skipped++;
+                    }
+                }
+            }
+            if (snapshot.entries.length === 0 && snapshot.files.length === 0 && dataTransfer && dataTransfer.files) {
+                for (let i = 0; i < dataTransfer.files.length; i++) {
+                    let file = dataTransfer.files[i];
+                    if (!file) {
+                        continue;
+                    }
+                    snapshot.files.push({
+                        file: file,
+                        relativePath: normalizeRelativeUnixPath(file.webkitRelativePath || file.name),
+                    });
+                }
+            }
+            return snapshot;
+        }
+
+        var uploadBatchQueue = [];
+        var uploadBatchRunning = false;
+        var uploadBatchCancelled = false;
+        var uploadDragDepth = 0;
+        var uploadFileConcurrency = 2;
+        var uploadSummarySuccessHideMs = 30000;
+        var uploadSummaryUpdateTimer = null;
+        var uploadSummaryRenderedFailureCount = -1;
+        var uploadSummaryState = {
+            total: 0,
+            queued: 0,
+            active: 0,
+            completed: 0,
+            failed: 0,
+            cancelled: 0,
+            jobs: [],
+            failures: [],
+            inProgress: false,
+            hideTimer: null,
+        };
+
+        function resetUploadSummary() {
+            if (uploadSummaryState.hideTimer) {
+                clearTimeout(uploadSummaryState.hideTimer);
+            }
+            uploadSummaryState = {
+                total: 0,
+                queued: 0,
+                active: 0,
+                completed: 0,
+                failed: 0,
+                cancelled: 0,
+                jobs: [],
+                failures: [],
+                inProgress: false,
+                hideTimer: null,
+            };
+            uploadSummaryRenderedFailureCount = -1;
+            renderUploadSummary();
+        }
+
+        function prepareUploadBatch(batch) {
+            let files = (batch && batch.files) || [];
+            batch.jobs = [];
+            for (let i = 0; i < files.length; i++) {
+                let item = files[i];
+                if (!item || !item.file) {
+                    continue;
+                }
+                batch.jobs.push({
+                    file: item.file,
+                    relativePath: item.relativePath,
+                    status: "queued",
+                    message: "",
+                    tracked: false,
+                });
+            }
+            return batch.jobs;
+        }
+
+        function scheduleUploadSummaryUpdate() {
+            if (uploadSummaryUpdateTimer) {
                 return;
+            }
+            uploadSummaryUpdateTimer = setTimeout(function () {
+                uploadSummaryUpdateTimer = null;
+                renderUploadSummary();
+            }, 100);
+        }
+
+        function setUploadJobStatus(job, status, message) {
+            if (!job || !job.tracked) {
+                return;
+            }
+            if (job.status !== "queued" && job.status !== "active") {
+                return;
+            }
+            if (job.status === status) {
+                return;
+            }
+            if (job.status === "queued") {
+                uploadSummaryState.queued--;
+            } else if (job.status === "active") {
+                uploadSummaryState.active--;
+            }
+            job.status = status;
+            job.message = message || "";
+            if (status === "active") {
+                uploadSummaryState.active++;
+            } else if (status === "completed") {
+                uploadSummaryState.completed++;
+            } else if (status === "failed") {
+                uploadSummaryState.failed++;
+                uploadSummaryState.failures.push({
+                    path: job.relativePath || (job.file ? job.file.name : "unknown"),
+                    message: job.message,
+                });
+            } else if (status === "cancelled") {
+                uploadSummaryState.cancelled++;
+            }
+            scheduleUploadSummaryUpdate();
+        }
+
+        function markUploadBatchFailed(batch, message) {
+            let jobs = (batch && batch.jobs) || [];
+            for (let i = 0; i < jobs.length; i++) {
+                if (jobs[i].status === "queued" || jobs[i].status === "active") {
+                    setUploadJobStatus(jobs[i], "failed", message);
+                }
+            }
+        }
+
+        function cancelPendingUploadBatches() {
+            uploadBatchCancelled = true;
+            uploadBatchQueue.length = 0;
+            for (let i = 0; i < uploadSummaryState.jobs.length; i++) {
+                let job = uploadSummaryState.jobs[i];
+                if (job.status === "queued") {
+                    setUploadJobStatus(job, "cancelled", "Upload stopped.");
+                }
+            }
+            scheduleUploadSummaryUpdate();
+        }
+
+        function enqueueUploadBatch(batch) {
+            if (!batch) {
+                return;
+            }
+            let jobs = prepareUploadBatch(batch);
+            if (jobs.length > 0) {
+                if (!uploadSummaryState.inProgress) {
+                    resetUploadSummary();
+                }
+                if (uploadSummaryState.hideTimer) {
+                    clearTimeout(uploadSummaryState.hideTimer);
+                    uploadSummaryState.hideTimer = null;
+                }
+                for (let i = 0; i < jobs.length; i++) {
+                    jobs[i].tracked = true;
+                    uploadSummaryState.jobs.push(jobs[i]);
+                    uploadSummaryState.total++;
+                    uploadSummaryState.queued++;
+                }
+                uploadSummaryState.inProgress = true;
+                scheduleUploadSummaryUpdate();
+            }
+            uploadBatchQueue.push(batch);
+            processUploadBatchQueue();
+        }
+
+        async function processUploadBatchQueue() {
+            if (uploadBatchRunning) {
+                return;
+            }
+            uploadBatchRunning = true;
+            try {
+                while (uploadBatchQueue.length > 0) {
+                    let nextBatch = uploadBatchQueue.shift();
+                    scheduleUploadSummaryUpdate();
+                    await runUploadBatch(nextBatch);
+                }
+            } finally {
+                uploadBatchRunning = false;
+                if (uploadBatchQueue.length > 0) {
+                    processUploadBatchQueue();
+                } else {
+                    finishUploadSummary();
+                }
+            }
+        }
+
+        function finishUploadSummary() {
+            if (!uploadSummaryState.inProgress) {
+                return;
+            }
+            uploadSummaryState.inProgress = false;
+            if (uploadSummaryState.hideTimer) {
+                clearTimeout(uploadSummaryState.hideTimer);
+                uploadSummaryState.hideTimer = null;
+            }
+            scheduleUploadSummaryUpdate();
+            if (uploadSummaryState.queued === 0 &&
+                uploadSummaryState.active === 0 &&
+                uploadSummaryState.failed === 0 &&
+                uploadSummaryState.cancelled === 0) {
+                uploadSummaryState.hideTimer = setTimeout(function () {
+                    uploadSummaryState.hideTimer = null;
+                    if (!uploadSummaryState.inProgress) {
+                        let summary = document.getElementById("uploadQueueSummary");
+                        if (summary) {
+                            summary.hidden = true;
+                        }
+                    }
+                }, uploadSummarySuccessHideMs);
+            }
+        }
+
+        function renderUploadSummary() {
+            let summary = document.getElementById("uploadQueueSummary");
+            if (!summary) {
+                return;
+            }
+            let state = uploadSummaryState;
+            let text = "";
+            let done = state.completed + state.failed + state.cancelled;
+            if (state.total > 0) {
+                if (state.inProgress) {
+                    text = "Uploading: " + done + " / " + state.total + " done";
+                    if (state.active > 0) {
+                        text += " \u00b7 " + state.active + " active";
+                    }
+                    if (state.queued > 0) {
+                        text += " \u00b7 " + state.queued + " queued";
+                    }
+                    if (state.failed > 0) {
+                        text += " \u00b7 " + state.failed + " failed";
+                    }
+                    if (state.cancelled > 0) {
+                        text += " \u00b7 " + state.cancelled + " cancelled";
+                    }
+                    if (uploadBatchQueue.length > 0) {
+                        text += " \u00b7 " + uploadBatchQueue.length + " batch" +
+                            (uploadBatchQueue.length === 1 ? "" : "es") + " waiting";
+                    }
+                } else if (state.failed > 0 || state.cancelled > 0) {
+                    text = "Upload finished: " + state.completed + " complete";
+                    if (state.failed > 0) {
+                        text += " \u00b7 " + state.failed + " failed";
+                    }
+                    if (state.cancelled > 0) {
+                        text += " \u00b7 " + state.cancelled + " cancelled";
+                    }
+                } else if (state.queued > 0 || state.active > 0) {
+                    text = "Upload stopped: " + done + " / " + state.total + " done";
+                    if (state.active > 0) {
+                        text += " \u00b7 " + state.active + " active";
+                    }
+                    if (state.queued > 0) {
+                        text += " \u00b7 " + state.queued + " not started";
+                    }
+                } else {
+                    text = "Upload complete: " + state.completed + " file" +
+                        (state.completed === 1 ? "" : "s");
+                }
+            }
+            if (!text) {
+                summary.hidden = true;
+                return;
+            }
+            summary.hidden = false;
+            let textElement = document.getElementById("uploadQueueSummaryText");
+            if (textElement) {
+                textElement.innerText = text;
+            }
+            let dismissButton = document.getElementById("uploadQueueSummaryDismiss");
+            if (dismissButton) {
+                dismissButton.hidden = state.inProgress;
+            }
+            let failures = document.getElementById("uploadQueueFailures");
+            let failuresSummary = document.getElementById("uploadQueueFailuresSummary");
+            let failuresList = document.getElementById("uploadQueueFailuresList");
+            if (failures && failuresSummary && failuresList) {
+                if (state.failures.length > 0) {
+                    failures.hidden = false;
+                    failuresSummary.innerText = state.failures.length + " failed";
+                    if (uploadSummaryRenderedFailureCount !== state.failures.length) {
+                        failuresList.innerHTML = "";
+                        for (let i = 0; i < state.failures.length; i++) {
+                            let item = document.createElement("li");
+                            let name = document.createElement("span");
+                            name.className = "uploadSummaryFailureName";
+                            name.innerText = state.failures[i].path;
+                            item.appendChild(name);
+                            if (state.failures[i].message) {
+                                let error = document.createElement("span");
+                                error.className = "uploadSummaryFailureMessage";
+                                error.innerText = state.failures[i].message;
+                                item.appendChild(error);
+                            }
+                            failuresList.appendChild(item);
+                        }
+                        uploadSummaryRenderedFailureCount = state.failures.length;
+                    }
+                } else {
+                    failures.hidden = true;
+                    failuresList.innerHTML = "";
+                    uploadSummaryRenderedFailureCount = 0;
+                }
+            }
+        }
+
+        function dismissUploadSummary() {
+            if (uploadSummaryState.inProgress) {
+                return;
+            }
+            if (uploadSummaryState.hideTimer) {
+                clearTimeout(uploadSummaryState.hideTimer);
+                uploadSummaryState.hideTimer = null;
+            }
+            if (uploadSummaryUpdateTimer) {
+                clearTimeout(uploadSummaryUpdateTimer);
+                uploadSummaryUpdateTimer = null;
+            }
+            let summary = document.getElementById("uploadQueueSummary");
+            if (summary) {
+                summary.hidden = true;
+            }
+        }
+
+        async function runUploadBatch(batch) {
+            uploadBatchCancelled = false;
+            let jobs = (batch && batch.jobs) || [];
+            try {
+                let directories = collectUploadDirectories(jobs, (batch && batch.directories) || []);
+                if (jobs.length === 0 && directories.size === 0) {
+                    return;
+                }
+                if (shouldUseZeroKnowledge() && getZeroKnowledgeState() == null) {
+                    let message = "Zero-knowledge encryption is enabled, but the encryption state is not ready. Unlock it before uploading.";
+                    alertBox(message);
+                    markUploadBatchFailed(batch, message);
+                    return;
+                }
+                await ensureUploadDirectories(batch.basePath, directories);
+                if (uploadBatchCancelled) {
+                    return;
+                }
+
+                let nextIndex = 0;
+                async function worker() {
+                    while (!uploadBatchCancelled) {
+                        let index = nextIndex++;
+                        if (index >= jobs.length) {
+                            return;
+                        }
+                        let job = jobs[index];
+                        if (!job || !job.file) {
+                            if (job) {
+                                setUploadJobStatus(job, "failed", "No file was selected.");
+                            }
+                            continue;
+                        }
+                        setUploadJobStatus(job, "active");
+                        let result;
+                        try {
+                            result = await startSendFile(job.file, false, {
+                                clearFullName: joinCloudPath(batch.basePath, job.relativePath),
+                                deferRefresh: true,
+                                suppressFailureAlert: true,
+                                shouldAbort: function () { return uploadBatchCancelled; }
+                            });
+                        } catch (error) {
+                            result = { status: "failed", message: error.message };
+                        }
+                        let status = result && result.status ? result.status : "failed";
+                        let message = result && result.message
+                            ? result.message
+                            : (status === "failed" ? "Upload failed." : "");
+                        setUploadJobStatus(job, status, message);
+                    }
+                }
+
+                let workers = [];
+                let workerCount = Math.min(uploadFileConcurrency, Math.max(1, jobs.length));
+                for (let i = 0; i < workerCount; i++) {
+                    workers.push(worker());
+                }
+                await Promise.all(workers);
+                if (!uploadBatchCancelled) {
+                    getDir(currentPath);
+                }
+            } catch (error) {
+                if (!uploadBatchCancelled) {
+                    alertBox("Upload failed: " + error.message);
+                    markUploadBatchFailed(batch, error.message);
+                    getDir(currentPath);
+                }
+            }
+        }
+
+        function onUploadDragEnter(ev) {
+            ev.preventDefault();
+            uploadDragDepth++;
+            let container = document.querySelector(".container");
+            if (container) {
+                container.classList.add("drag-over");
+            }
+        }
+
+        function onUploadDragOver(ev) {
+            ev.preventDefault();
+            if (ev.dataTransfer) {
+                try {
+                    ev.dataTransfer.dropEffect = "copy";
+                } catch (error) {
+                }
+            }
+        }
+
+        function onUploadDragLeave(ev) {
+            uploadDragDepth = Math.max(0, uploadDragDepth - 1);
+            if (uploadDragDepth === 0) {
+                let container = document.querySelector(".container");
+                if (container) {
+                    container.classList.remove("drag-over");
+                }
+            }
+        }
+
+        async function dropHandler(ev) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            uploadDragDepth = 0;
+            let container = document.querySelector(".container");
+            if (container) {
+                container.classList.remove("drag-over");
+            }
+            if (!canUploadToCurrentPath()) {
+                return;
+            }
+
+            // DataTransfer items are only valid while the event is being handled,
+            // so snapshot entries before the first await.
+            let snapshot = snapshotDroppedItems(ev.dataTransfer);
+            let batch = {
+                basePath: currentPath,
+                files: snapshot.files.slice(),
+                directories: [],
+            };
+            for (let i = 0; i < snapshot.entries.length; i++) {
+                let entry = snapshot.entries[i];
+                await walkDroppedEntry(entry, entry ? entry.name : "", batch);
+            }
+            if (snapshot.skipped > 0) {
+                alertBox("Some dropped items could not be read. Use the Upload folder button if folder drag-and-drop is unavailable in this browser.");
+            }
+            if (batch.files.length === 0 && batch.directories.length === 0) {
+                if (snapshot.skipped === 0) {
+                    alertBox("No files or folders were found in the drop.");
+                }
+                return;
+            }
+            enqueueUploadBatch(batch);
+        }
+
+        function openUploadPicker(kind) {
+            if (!canUploadToCurrentPath()) {
+                return;
+            }
+            let input = document.getElementById(kind === "folder" ? "uploadFolderInput" : "uploadFilesInput");
+            if (input) {
+                input.click();
+            }
+        }
+
+        function onUploadFilesPicked(ev) {
+            collectPickedUploads(ev.target, false);
+        }
+
+        function onUploadFolderPicked(ev) {
+            collectPickedUploads(ev.target, true);
+        }
+
+        function collectPickedUploads(input, isFolder) {
+            if (!input) {
+                return;
+            }
+            try {
+                if (!canUploadToCurrentPath()) {
+                    return;
+                }
+                let picked = input.files ? Array.from(input.files) : [];
+                if (picked.length === 0) {
+                    if (isFolder) {
+                        alertBox("The selected folder is empty. The browser folder picker does not expose empty folders; drag and drop the folder to preserve empty subfolders.");
+                    }
+                    return;
+                }
+                let files = [];
+                for (let i = 0; i < picked.length; i++) {
+                    let file = picked[i];
+                    if (!file) {
+                        continue;
+                    }
+                    let relativePath = normalizeRelativeUnixPath(file.webkitRelativePath || file.name);
+                    if (!relativePath) {
+                        continue;
+                    }
+                    files.push({ file: file, relativePath: relativePath });
+                }
+                if (files.length === 0) {
+                    if (isFolder) {
+                        alertBox("No files were found in the selected folder.");
+                    }
+                    return;
+                }
+                enqueueUploadBatch({
+                    basePath: currentPath,
+                    files: files,
+                    directories: [],
+                });
+            } finally {
+                input.value = "";
+            }
+        }
+
+        async function startSendFile(file, defer, uploadTarget) {
+            if (defer) {
+                setTimeout(() => startSendFile(file, false, uploadTarget), 1);
+                return;
+            }
+            if (!file) {
+                return { status: "failed", message: "No file was selected." };
+            }
+            uploadTarget = uploadTarget || {};
+            let shouldAbort = typeof uploadTarget.shouldAbort === "function"
+                ? uploadTarget.shouldAbort
+                : function () { return false; };
+            let suppressFailureAlert = !!uploadTarget.suppressFailureAlert;
+            if (shouldAbort()) {
+                return { status: "cancelled", message: "Upload stopped." };
+            }
+            let clearFullName = normalizeRelativeUnixPath(
+                uploadTarget.clearFullName || (currentPath == "" ? file.name : currentPath + "/" + file.name)
+            );
+            if (!clearFullName) {
+                return { status: "failed", message: "The upload destination name is empty." };
             }
             let session = null;
             try {
                 if (file.size > 2147483647) {
                     throw new Error("Files larger than 2 GB are not supported by the current server protocol.");
                 }
-                let clearFullName = normalizeRelativeUnixPath(
-                    currentPath == "" ? file.name : currentPath + "/" + file.name
-                );
                 let unixLastWriteTimestamp = Math.floor((file.lastModified || Date.now()) / 1000) >>> 0;
                 let encryption = await createUploadEncryptionContext(
                     clearFullName,
                     unixLastWriteTimestamp,
                     file.size
                 );
+                if (shouldAbort()) {
+                    return { status: "cancelled", message: "Upload stopped." };
+                }
                 if (uploadSessions[encryption.fullName]) {
                     throw new Error("An upload with this destination name is already in progress.");
                 }
@@ -3453,10 +4257,16 @@
                     isZeroKnowledge: encryption.isZeroKnowledge,
                     progress: null,
                     cancelled: false,
+                    cancelRequested: false,
                     failed: false,
                     completed: false,
                     inFlight: false,
+                    deferRefresh: !!uploadTarget.deferRefresh,
+                    suppressFailureAlert: suppressFailureAlert,
                 };
+                session.finished = new Promise(function (resolve) {
+                    session.resolveFinished = resolve;
+                });
 
                 if (!addProgressBar(
                     encryption.fullName,
@@ -3473,12 +4283,23 @@
 
                 // Let the browser paint the progress bar before any file I/O or crypto work starts.
                 await waitForNextPaint();
+                if (shouldAbort()) {
+                    session.cancelRequested = true;
+                    failUpload(session, null);
+                    return session.finished;
+                }
                 await sendUploadChunk(session, 1);
+                return session.finished;
             } catch (e) {
                 if (session) {
                     failUpload(session, "Upload failed: " + e.message);
+                    return session.finished;
                 } else {
-                    alertBox("Upload failed: " + e.message);
+                    let result = { status: "failed", message: "Upload failed: " + e.message };
+                    if (!suppressFailureAlert) {
+                        alertBox(result.message);
+                    }
+                    return result;
                 }
             }
         }
@@ -3717,6 +4538,32 @@
             fileContainer.appendChild(fileItemBox);
             content.appendChild(fileContainer);
         }
+        function getSelectedFileNames() {
+            let names = new Set();
+            let checkBoxs = document.querySelectorAll("#content input.fileSelector");
+            for (let i = 0; i < checkBoxs.length; i++) {
+                if (!checkBoxs[i].checked || !checkBoxs[i].file) {
+                    continue;
+                }
+                let name = checkBoxs[i].file.Name;
+                if (name && name !== "..") {
+                    names.add(name);
+                }
+            }
+            return { path: currentPath, names: names };
+        }
+
+        function restoreSelectedFileNames(selection, clearPath) {
+            if (!selection || selection.path !== clearPath) {
+                return;
+            }
+            let checkBoxs = document.querySelectorAll("#content input.fileSelector");
+            for (let i = 0; i < checkBoxs.length; i++) {
+                let name = checkBoxs[i].file ? checkBoxs[i].file.Name : null;
+                checkBoxs[i].checked = !!(name && selection.names.has(name));
+            }
+        }
+
         function allFileSelected() {
             let result = [];
             let checkBoxs = document.getElementsByTagName('input');
@@ -4095,6 +4942,71 @@
             display: none;
         }
 
+        .uploadSummary {
+            margin: 8px;
+            padding: 8px;
+            border: 1px solid rgba(160, 220, 160, 0.45);
+            border-radius: 4px;
+            background: rgba(0, 0, 0, 0.25);
+            font-size: small;
+            line-height: 1.35;
+            overflow-wrap: anywhere;
+        }
+
+        .uploadSummary[hidden] {
+            display: none;
+        }
+
+        .uploadSummaryHeader {
+            display: flex;
+            align-items: flex-start;
+            gap: 6px;
+        }
+
+        .uploadSummaryText {
+            flex: 1;
+        }
+
+        .uploadSummaryDismiss {
+            margin: 0;
+            padding: 0 6px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+            background: transparent;
+            color: #fff;
+            cursor: pointer;
+            line-height: 1.2;
+        }
+
+        .uploadSummaryDismiss[hidden] {
+            display: none;
+        }
+
+        .uploadSummaryFailures {
+            margin-top: 6px;
+            max-height: 140px;
+            overflow-y: auto;
+        }
+
+        .uploadSummaryFailures[hidden] {
+            display: none;
+        }
+
+        .uploadSummaryFailures ul {
+            margin: 4px 0 0;
+            padding-left: 16px;
+        }
+
+        .uploadSummaryFailureName {
+            display: block;
+            word-break: break-word;
+        }
+
+        .uploadSummaryFailureMessage {
+            display: block;
+            color: #ffb0b0;
+        }
+
         .cancelUpload {
             margin: 0px 10px 0px 0px;
             padding: 0px 6px;
@@ -4333,7 +5245,8 @@
 </head>
 
 <body>
-    <section class="container" ondrop="dropHandler(event);" onDragOver="event.preventDefault();">
+    <section class="container" ondrop="dropHandler(event);" ondragover="onUploadDragOver(event);"
+        ondragenter="onUploadDragEnter(event);" ondragleave="onUploadDragLeave(event);">
         <section id="topBar" class="topBar">
             <div id="alertBox" class="alertBox"></div><br />
             <div id="zkModeBadge" class="zkModeBadge" hidden></div>
@@ -4348,6 +5261,24 @@
                 <button onclick="GetStorageInfo();" class="functionButton expand">Get storage info</button>
                 <button onclick="GetOccupiedSpaceOfImages();" class="functionButton expand">Get occupied space of
                     pictures</button>
+                <button disabled id="uploadFilesButton" class="functionButton expand"
+                    onclick="openUploadPicker('files');" title="Upload one or more files">Upload files</button>
+                <button disabled id="uploadFolderButton" class="functionButton expand"
+                    onclick="openUploadPicker('folder');" title="Upload a folder and its subfolders">Upload folder</button>
+                <input hidden id="uploadFilesInput" type="file" multiple onchange="onUploadFilesPicked(event);">
+                <input hidden id="uploadFolderInput" type="file" webkitdirectory multiple
+                    onchange="onUploadFolderPicked(event);">
+                <div id="uploadQueueSummary" class="uploadSummary" hidden>
+                    <div class="uploadSummaryHeader">
+                        <span id="uploadQueueSummaryText" class="uploadSummaryText"></span>
+                        <button id="uploadQueueSummaryDismiss" class="uploadSummaryDismiss" type="button"
+                            title="Dismiss upload status" onclick="dismissUploadSummary();" hidden>&times;</button>
+                    </div>
+                    <details id="uploadQueueFailures" class="uploadSummaryFailures" hidden>
+                        <summary id="uploadQueueFailuresSummary"></summary>
+                        <ul id="uploadQueueFailuresList"></ul>
+                    </details>
+                </div>
                 <!-- To enter it is not necessary to login, you can retrieve the saved session, in production this function must be protected by a pin -->
                 <button onclick="LoadClient(0);" class="functionButton expand">Load session</button>
                 <!-- freeze the current session state on the cloud to enter without having to create a new client -->
@@ -4417,7 +5348,7 @@
                     <canvas id="qrcanv"></canvas>
                 </div>
             </section>
-            <section id="bottom" class="bottom" ondrop="dropHandler(event);">
+            <section id="bottom" class="bottom">
                 <p id="zkFileOperationsNotice" role="status" hidden>Rename, Move and Copy are temporarily unavailable to protect files encrypted with zero-knowledge encryption.</p>
                 <button disabled id="delete" class="functionButton" onclick="onDeleteButton();"
                     title="Delete">Delete</button>

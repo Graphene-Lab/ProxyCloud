@@ -3304,7 +3304,7 @@
 
     <!--functions to dynamically add HTML elements to the page-->
     <script>
-        function addProgressBar(text, max, isUplload, labelText) {
+        function addProgressBar(text, max, isUplload, labelText, onCancel) {
             if (pendingFiles[text] == undefined || pendingFiles[text] == null) {
                 let container = document.createElement("container");
                 pendingFiles[text] = container;
@@ -3312,9 +3312,11 @@
                 if (isUplload) {
                     ico = '\u2b06';
                 }
+                let baseLabel = ico + (labelText || text);
+                let statusText = "";
                 let label = document.createElement("label");
                 label.for = text;
-                label.innerText = ico + (labelText || text);
+                label.innerText = baseLabel;
                 let progressBar = document.createElement("progress");
                 container.appendChild(label);
                 container.appendChild(progressBar);
@@ -3323,24 +3325,56 @@
                 progressBar.value = 0;
                 progressBar.className = "progressBar";
                 let topBar = document.getElementById("topBar");
-                container.remove = function (position) {
+                function renderLabel() {
+                    label.innerText = baseLabel + (statusText ? " \u00b7 " + statusText : "");
+                }
+                container.remove = function () {
+                    clearTimeout(container.timeout);
                     pendingFiles[text] = null;
-                    topBar.removeChild(container);
+                    if (container.parentNode) {
+                        topBar.removeChild(container);
+                    }
+                }
+                container.update = function (value, status) {
+                    if (status !== undefined) {
+                        statusText = status;
+                        renderLabel();
+                    }
+                    if (value !== undefined) {
+                        progressBar.value = Math.max(0, Math.min(value, progressBar.max));
+                    }
+                    clearTimeout(container.timeout);
+                    container.timeout = setTimeout(container.remove, 600000);
+                }
+                container.complete = function () {
+                    clearTimeout(container.timeout);
+                    progressBar.value = progressBar.max;
+                    container.remove();
+                }
+                container.fail = function () {
+                    container.remove();
                 }
                 container.set = function (value) {
                     if (value == undefined) {
-                        value = progressBar.max;
+                        container.complete();
+                        return;
                     }
-                    clearTimeout(container.timeout);
-                    //percentage = round((value / max) * 100);
-                    //bar.style.width = percentage + "%";
-                    progressBar.value = value;
+                    container.update(value);
                     if (value >= progressBar.max) {
-                        container.remove();
+                        container.complete();
                     }
-                    else {
-                        container.timeout = setTimeout(container.remove, 600000);
-                    }
+                }
+                if (typeof onCancel === "function") {
+                    let cancelButton = document.createElement("button");
+                    cancelButton.type = "button";
+                    cancelButton.className = "cancelUpload";
+                    cancelButton.innerText = "\u00d7";
+                    cancelButton.title = "Cancel upload";
+                    cancelButton.onclick = function (event) {
+                        event.stopPropagation();
+                        onCancel();
+                    };
+                    container.appendChild(cancelButton);
                 }
                 let timeout = setTimeout(container.remove, 600000);
                 container.timeout = timeout;
@@ -3783,7 +3817,7 @@
             QRkey: null, // Key added in the QR code type 2 implementation, it is used to decrypt the QR code data sent via proxy
         }
         var proxy = "http://proxy.tc0.it:" + defaultProxyPort;
-        var pendingFiles = []; // dictionary for progress bars of download operations
+        var pendingFiles = Object.create(null); // dictionary for upload/download progress bars
         if (isDebug) {
             proxy = "https://localhost:7060";
         }

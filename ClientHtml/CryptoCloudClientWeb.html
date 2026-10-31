@@ -1157,7 +1157,13 @@
         }
 
         function bufferToBase64(buffer) {
-            const exportedAsString = bufferToStringBinary(buffer);
+            let bytes = toByteArray(buffer);
+            if (typeof bytes.toBase64 === "function") {
+                // Newer Chromium/Edge versions provide a native, much faster
+                // implementation. Fall back to btoa for older browsers.
+                return bytes.toBase64();
+            }
+            const exportedAsString = bufferToStringBinary(bytes);
             return btoa(exportedAsString);
         }
 

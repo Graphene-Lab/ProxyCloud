@@ -1806,34 +1806,36 @@
             return decryptFullFileNameZk(path, state.filenameObfuscationKey);
         }
 
-        async function encryptFileForTransport(clearFullPath, clearData, unixLastWriteTimestamp) {
+        async function createUploadEncryptionContext(clearFullPath, unixLastWriteTimestamp, fileSize) {
             clearFullPath = normalizeRelativeUnixPath(clearFullPath);
             let state = getZeroKnowledgeState();
             if (state == null) {
+                if (shouldUseZeroKnowledge()) {
+                    throw new Error("Zero-knowledge encryption is enabled, but the encryption state is not ready. Unlock it before uploading.");
+                }
                 zkLog("Upload uses clear payload (no ZK state).", clearFullPath);
                 return {
                     fullName: clearFullPath,
-                    data: clearData,
+                    cipherState: null,
                     unixLastWriteTimestamp: unixLastWriteTimestamp >>> 0,
+                    isZeroKnowledge: false,
                 };
             }
             let virtualFullPath = encryptFullFileNameZk(clearFullPath, state.filenameObfuscationKey);
             let key = deriveContentKeyFromClearPath(clearFullPath, unixLastWriteTimestamp >>> 0, state);
-            let encryptedData = cryptFileBytes(clearData, key);
             let keyHash4 = bufferToHex((await hash256(key)).slice(0, 4));
-            zkLog("Encrypt upload payload.", {
+            zkLog("Prepare encrypted upload.", {
                 clearFullPath: clearFullPath,
                 virtualFullPath: virtualFullPath,
-                bytes: toByteArray(clearData).byteLength,
+                bytes: fileSize,
                 unixLastWriteTimestamp: unixLastWriteTimestamp >>> 0,
                 keyHash4: keyHash4,
-                clearHead16: bytesPreviewHex(clearData, 16),
-                encHead16: bytesPreviewHex(encryptedData, 16),
             });
             return {
                 fullName: virtualFullPath,
-                data: encryptedData,
+                cipherState: createCipherState(key),
                 unixLastWriteTimestamp: unixLastWriteTimestamp >>> 0,
+                isZeroKnowledge: true,
             };
         }
 
@@ -2637,7 +2639,12 @@
             },
             Error: function (params) {
                 let error = bufferToString(params[0]);
-                alert(error);
+                let activeUploads = Object.keys(uploadSessions).some(key => uploadSessions[key]);
+                if (activeUploads) {
+                    failAllUploads("Upload failed: " + error);
+                } else {
+                    alert(error);
+                }
             },
             GetDir: async function (params) {
                 let content = document.getElementById("content");
@@ -2747,43 +2754,35 @@
             SetFile: function (params) {
                 let nameFileAndChunk = bufferToString(params[0])
                 if (nameFileAndChunk == "507") {
-                    alertBox("Error: There is no space left on the device!");                    
-                    // Remove all progress bars and reset upload statuses
-                    for (let fileName in pendingFiles) {
-                            if (pendingFiles[fileName] && typeof pendingFiles[fileName].remove === "function") {
-                                pendingFiles[fileName].remove();
-                            }
-                            pendingFiles[fileName] = undefined;
-                            upload[fileName] = undefined;
-                            chunkLength[fileName] = undefined;
-                            chunkParts[fileName] = undefined;
-                            chunkRequest[fileName] = undefined;
-                            uploadDisplayNameByTransport[fileName] = undefined;
-                            uploadUnixTimestampByTransport[fileName] = undefined;
-                        }
+                    failAllUploads("Error: There is no space left on the device!");
                     return;
                 }
                 let nameFileAndChunkParts = nameFileAndChunk.split("\t");
-                let fullFileName = nameFileAndChunkParts[0];
-                let nextChunkNumber = parseInt(nameFileAndChunkParts[1]) + 1;
-                if (nextChunkNumber > chunkParts[fullFileName]) {
-                    // upload completed successfully
-                    pendingFiles[fullFileName].set(); // set progressBarr to end position, and remove the bar from the view
-                    upload[fullFileName] = undefined;
-                    chunkLength[fullFileName] = undefined;
-                    chunkParts[fullFileName] = undefined;
-                    chunkRequest[fullFileName] = undefined;
-                    uploadDisplayNameByTransport[fullFileName] = undefined;
-                    uploadUnixTimestampByTransport[fullFileName] = undefined;
-                    getDir(currentPath);
-                    // } else if (upload[fullFileName] != undefined) {
-                    //     // send next chunk
-                    //     setFile(fullFileName, nextChunkNumber, upload[fullFileName]);
-                } else if (chunkRequest[fullFileName] != undefined) {
-                    // Execute the event that asks for the next chunk to be sent
-                    let chunkRequestCallback = chunkRequest[fullFileName];
-                    chunkRequestCallback(fullFileName, nextChunkNumber); // Notification that it is ready to receive the next file
+                if (nameFileAndChunkParts.length < 2) {
+                    zkLog("Ignoring malformed SetFile response.", nameFileAndChunk);
+                    return;
                 }
+                let fullFileName = nameFileAndChunkParts[0];
+                let serverChunkNumber = parseInt(nameFileAndChunkParts[1]);
+                let session = uploadSessions[fullFileName];
+                if (!session || session.cancelled) {
+                    return;
+                }
+                if (!isFinite(serverChunkNumber) || serverChunkNumber !== session.nextChunk) {
+                    failUpload(session, "Upload stopped because the server acknowledged an unexpected chunk.");
+                    return;
+                }
+                session.inFlight = false;
+                if (serverChunkNumber >= session.totalChunks) {
+                    completeUpload(session);
+                    return;
+                }
+                session.nextChunk = serverChunkNumber + 1;
+                session.offset = Math.min(session.fileSize, serverChunkNumber * session.chunkSize);
+                session.progress.update(session.offset, "waiting for server");
+                sendUploadChunk(session, session.nextChunk).catch(function (e) {
+                    failUpload(session, "Upload failed: " + e.message);
+                });
             },
             Delete: function (params) {
                 this.GetDir(params);
@@ -3025,79 +3024,232 @@
             }
             executeRequest(command.Share, transportFullName + "\t" + chunkNumber);
         }
-        function setFile(fullFileName, chunkNumber, data, chunkRequestCallback, unixLastWriteTimestamp, displayName) {
-            // chunkNumber is base 1 (the first chunk is number 1)
-            fullFileName = normalizeRelativeUnixPath(fullFileName);
-            upload[fullFileName] = data;
-            if (typeof unixLastWriteTimestamp === "number") {
-                uploadUnixTimestampByTransport[fullFileName] = unixLastWriteTimestamp >>> 0;
-            }
-            if (displayName) {
-                uploadDisplayNameByTransport[fullFileName] = displayName;
-            }
-            let fileLength = data.byteLength;
-            let position = (chunkNumber - 1) * chunkSize;
-            let toTake = fileLength - position;
-            if (toTake > chunkSize)
-                toTake = chunkSize;
-            let chunkData = data.slice(position, position + toTake);
-            uploadFile(fullFileName, chunkData, chunkNumber, fileLength, chunkRequestCallback)
+        var uploadYieldChannel = null;
+        var uploadYieldResolvers = [];
+        function yieldToUi() {
+            return new Promise(resolve => {
+                if (typeof MessageChannel === "undefined") {
+                    setTimeout(resolve, 0);
+                    return;
+                }
+                if (uploadYieldChannel == null) {
+                    uploadYieldChannel = new MessageChannel();
+                    uploadYieldChannel.port1.onmessage = function () {
+                        let resolver = uploadYieldResolvers.shift();
+                        if (resolver) {
+                            resolver();
+                        }
+                    };
+                }
+                uploadYieldResolvers.push(resolve);
+                uploadYieldChannel.port2.postMessage(0);
+            });
         }
-        function uploadFile(fullFileName, chunkData, chunkNumber, fileLength, chunkRequestCallback) {
-            // fullFileName is the name with the full path to the destination, in unix format, example "pictures/logo.png"
-            // chunkData is a data buffer which represents the chunk
-            // chunkNumber is base 1 (the first chunk number must be 1)
-            // fileLength is the overall length of the file being sent (byte length of file)
-            // chunkRequestCallback is a function of the type chunkRequestCallback(fullFileName, chunkNumber) used as an event that is passed as a parameter in the first chunk, which will be called when the system is ready to receive the next chunk. This function will be used as an event that fires when the next chunk needs to be sent. Don't send chunks before this function is called! This function has a fullFileName parameter that will be passed when the function is called, and the chunkNumber parameter which indicates the requested chunk number (base 1).
-            // Return true when the operation is completed or must be aborted (if it returns true, the operation must be aborted and no more chunks sent). Returns false if the operation must complete with sending the remaining ckunks to complete sending the file
-            // NOTE: Important: You must never send two files with the same fullFileName simultaneously. This function returns true when you need to stop sending chunks (respect this!).
-            if (chunkNumber <= 0) {
-                debugger; // the first chunk number must be 1 !!
-            }
-            if (chunkRequestCallback != null) {
-                chunkRequest[fullFileName] = chunkRequestCallback;
-            }
-            let lengthOfChunks;
-            if (chunkData.byteLength == fileLength) {
-                lengthOfChunks = fileLength;
-            } else if (chunkNumber == 1) {
-                lengthOfChunks = chunkData.byteLength;
-                chunkLength[fullFileName] = lengthOfChunks;
-            } else {
-                lengthOfChunks = chunkLength[fullFileName]
-            }
-            let parts = Math.ceil(fileLength / lengthOfChunks);
-            parts = parts == 0 ? 1 : parts;
-            chunkParts[fullFileName] = parts;
-            if (chunkNumber == 1) {
-                // add the progress bar
-                let progressLabel = uploadDisplayNameByTransport[fullFileName] || fullFileName;
-                if (!addProgressBar(fullFileName, fileLength, true, progressLabel)) {
-                    return true; // Operation with this file already in progress
+
+        function waitForNextPaint() {
+            return new Promise(resolve => {
+                let done = false;
+                let finish = function () {
+                    if (done) {
+                        return;
+                    }
+                    done = true;
+                    resolve();
+                };
+                if (typeof requestAnimationFrame === "function") {
+                    requestAnimationFrame(finish);
+                }
+                setTimeout(finish, 50);
+            });
+        }
+
+        function abortActiveUpload(transportName) {
+            let request = activeRequests[transportName];
+            if (request) {
+                try {
+                    request.abort();
+                } catch (e) {
+                    zkLog("Could not abort upload request.", e);
                 }
             }
-            let position = (chunkNumber - 1) * lengthOfChunks;
-            pendingFiles[fullFileName].set(position); // set position of progressBarr
+        }
+
+        function completeUpload(session) {
+            if (!session || session.completed) {
+                return;
+            }
+            session.completed = true;
+            session.inFlight = false;
+            if (uploadSessions[session.transportName] === session) {
+                delete uploadSessions[session.transportName];
+            }
+            if (session.progress) {
+                session.progress.complete();
+            }
+            getDir(currentPath);
+        }
+
+        function failUpload(session, message) {
+            if (!session || session.failed) {
+                return;
+            }
+            session.failed = true;
+            session.cancelled = true;
+            session.inFlight = false;
+            if (uploadSessions[session.transportName] === session) {
+                delete uploadSessions[session.transportName];
+            }
+            abortActiveUpload(session.transportName);
+            if (session.progress) {
+                session.progress.fail();
+            }
+            if (message) {
+                alertBox(message);
+            }
+        }
+
+        function failAllUploads(message) {
+            let names = Object.keys(uploadSessions);
+            for (let i = 0; i < names.length; i++) {
+                let session = uploadSessions[names[i]];
+                if (session) {
+                    failUpload(session, null);
+                }
+            }
+            if (message) {
+                alertBox(message);
+            }
+        }
+
+        function cancelUpload(transportName) {
+            let session = uploadSessions[transportName];
+            if (!session) {
+                return;
+            }
+            failUpload(session, "Upload canceled: " + (session.clearFullName || transportName));
+        }
+
+        async function sendUploadChunk(session, chunkNumber) {
+            if (!session || session.cancelled || uploadSessions[session.transportName] !== session) {
+                return;
+            }
+            if (chunkNumber !== session.nextChunk) {
+                failUpload(session, "Upload stopped because the client and server are not on the same chunk.");
+                return;
+            }
+            const offset = (chunkNumber - 1) * session.chunkSize;
+            const length = Math.min(session.chunkSize, Math.max(0, session.fileSize - offset));
+            const chunkLabel = "chunk " + chunkNumber + "/" + session.totalChunks;
+            const encryptionShare = session.isZeroKnowledge ? 0.5 : 0.1;
+            const sendStart = offset + Math.floor(length * encryptionShare);
+            session.progress.update(offset, "reading " + chunkLabel + (session.isZeroKnowledge ? " (ZK)" : ""));
+
+            let clearBuffer;
+            try {
+                clearBuffer = await session.file.slice(offset, offset + length).arrayBuffer();
+            } catch (e) {
+                failUpload(session, "Upload failed while reading " + chunkLabel + ": " + e.message);
+                return;
+            }
+            if (session.cancelled) {
+                return;
+            }
+
+            let chunkData;
+            try {
+                if (session.cipherState) {
+                    chunkData = new Uint8Array(length);
+                    const clearBytes = new Uint8Array(clearBuffer);
+                    let lastProgress = 0;
+                    for (let p = 0; p < length; p += encryptionSliceSize) {
+                        if (session.cancelled) {
+                            return;
+                        }
+                        const end = Math.min(p + encryptionSliceSize, length);
+                        cryptChunkInto(clearBytes.subarray(p, end), session.cipherState, chunkData, p);
+                        let now = performance.now();
+                        if (now - lastProgress >= 50 || end === length) {
+                            let percent = length === 0 ? 100 : Math.floor((end / length) * 100);
+                            let encryptedProgress = offset + Math.floor((end / Math.max(1, length)) * (sendStart - offset));
+                            session.progress.update(encryptedProgress, "encrypting " + percent + "% " + chunkLabel);
+                            lastProgress = now;
+                        }
+                        await yieldToUi();
+                    }
+                    if (length === 0) {
+                        session.progress.update(offset, "encrypting 100% " + chunkLabel);
+                    }
+                } else {
+                    chunkData = new Uint8Array(clearBuffer);
+                }
+            } catch (e) {
+                failUpload(session, "Upload failed while encrypting " + chunkLabel + ": " + e.message);
+                return;
+            }
+            if (session.cancelled) {
+                return;
+            }
+
+            session.progress.update(sendStart, "sending 0% " + chunkLabel);
+            session.lastUploadProgressPercent = -1;
+            try {
+                enqueueUploadChunkPayload(session, chunkData, chunkNumber, offset, length, sendStart, chunkLabel);
+            } catch (e) {
+                failUpload(session, "Upload failed while preparing " + chunkLabel + ": " + e.message);
+            }
+        }
+
+        function enqueueUploadChunkPayload(session, chunkData, chunkNumber, offset, length, sendStart, chunkLabel) {
             let File = {
-                FullName: fullFileName,
+                FullName: session.transportName,
                 Data: bufferToBase64(chunkData),
                 ChunkPart: chunkNumber,
-                TotalChunk: parts,
+                TotalChunk: session.totalChunks,
             };
-            if (chunkNumber === parts) {
-                File.UnixLastWriteTimestamp = uploadUnixTimestampByTransport[fullFileName] || 0;
+            if (chunkNumber === session.totalChunks) {
+                File.UnixLastWriteTimestamp = session.unixLastWriteTimestamp || 0;
             }
-            if (chunkNumber === 1 || chunkNumber === parts) {
+            if (chunkNumber === 1 || chunkNumber === session.totalChunks) {
                 zkLog("SetFile chunk out.", {
-                    fullFileName: fullFileName,
+                    fullFileName: session.transportName,
                     chunkNumber: chunkNumber,
-                    totalChunks: parts,
+                    totalChunks: session.totalChunks,
                     chunkBytes: chunkData.byteLength,
                     unixLastWriteTimestamp: File.UnixLastWriteTimestamp >>> 0,
                 });
             }
-            executeRequest(command.SetFile, JSON.stringify(File));
-            return false;
+            session.inFlight = true;
+            executeRequest(command.SetFile, JSON.stringify(File), {
+                requestKey: session.transportName,
+                requireResponse: true,
+                shouldAbort: function () {
+                    return session.cancelled || uploadSessions[session.transportName] !== session;
+                },
+                onUploadProgress: function (loaded, total) {
+                    if (session.cancelled) {
+                        return;
+                    }
+                    let fraction = total > 0 ? Math.min(1, loaded / total) : 1;
+                    let percent = Math.floor(fraction * 100);
+                    if (percent === session.lastUploadProgressPercent) {
+                        return;
+                    }
+                    session.lastUploadProgressPercent = percent;
+                    let progress = sendStart + Math.floor(fraction * ((offset + length) - sendStart));
+                    session.progress.update(progress, "sending " + percent + "% " + chunkLabel);
+                },
+                onError: function (error) {
+                    if (session.cancelled) {
+                        return;
+                    }
+                    let reason = error && error.emptyResponse
+                        ? "empty server response"
+                        : error && error.error
+                            ? "invalid server response"
+                            : error && error.status ? "HTTP " + error.status : "network error";
+                    failUpload(session, "Upload failed while sending chunk " + chunkNumber + "/" + session.totalChunks + " (" + reason + "). No automatic retry was attempted.");
+                }
+            });
         }
         async function delete_(path, files) {
             if (files) {
@@ -3251,32 +3403,71 @@
                 }
             }
         }
-        function startSendFile(file, async) {
-            if (async) {
+        async function startSendFile(file, defer) {
+            if (defer) {
                 setTimeout(() => startSendFile(file, false), 1);
                 return;
             }
-            let fr = new FileReader();
-            fr.onload = async function () {
-                let data = fr.result;
-
-                let clearFullName;
-                if (currentPath == "") {
-                    clearFullName = file.name;
-                } else {
-                    clearFullName = currentPath + "/" + file.name;
+            let session = null;
+            try {
+                if (file.size > 2147483647) {
+                    throw new Error("Files larger than 2 GB are not supported by the current server protocol.");
                 }
+                let clearFullName = normalizeRelativeUnixPath(
+                    currentPath == "" ? file.name : currentPath + "/" + file.name
+                );
                 let unixLastWriteTimestamp = Math.floor((file.lastModified || Date.now()) / 1000) >>> 0;
-                let encrypted = await encryptFileForTransport(clearFullName, data, unixLastWriteTimestamp);
-                function chunkRequestCallback(fullFileName, numberOfChunksRequested) {
-                    // This function will be called as an event when the system requests to send the next chunk
-                    // Function that is called to ask for the following chunk
-                    setFile(fullFileName, numberOfChunksRequested, upload[fullFileName]);
+                let encryption = await createUploadEncryptionContext(
+                    clearFullName,
+                    unixLastWriteTimestamp,
+                    file.size
+                );
+                if (uploadSessions[encryption.fullName]) {
+                    throw new Error("An upload with this destination name is already in progress.");
                 }
-                setFile(encrypted.fullName, 1, encrypted.data, chunkRequestCallback, encrypted.unixLastWriteTimestamp, clearFullName);
-                //setFile(currentPath + "/" + file.name, 1, data)
-            };
-            fr.readAsArrayBuffer(file);
+
+                session = {
+                    transportName: encryption.fullName,
+                    clearFullName: clearFullName,
+                    file: file,
+                    fileSize: file.size,
+                    chunkSize: uploadChunkSize,
+                    totalChunks: Math.max(1, Math.ceil(file.size / uploadChunkSize)),
+                    nextChunk: 1,
+                    offset: 0,
+                    unixLastWriteTimestamp: encryption.unixLastWriteTimestamp,
+                    cipherState: encryption.cipherState,
+                    isZeroKnowledge: encryption.isZeroKnowledge,
+                    progress: null,
+                    cancelled: false,
+                    failed: false,
+                    completed: false,
+                    inFlight: false,
+                };
+
+                if (!addProgressBar(
+                    encryption.fullName,
+                    file.size,
+                    true,
+                    clearFullName,
+                    function () { cancelUpload(encryption.fullName); }
+                )) {
+                    throw new Error("An upload with this destination name is already in progress.");
+                }
+                session.progress = pendingFiles[encryption.fullName];
+                uploadSessions[encryption.fullName] = session;
+                session.progress.update(0, "reading chunk 1/" + session.totalChunks + (session.isZeroKnowledge ? " (ZK)" : ""));
+
+                // Let the browser paint the progress bar before any file I/O or crypto work starts.
+                await waitForNextPaint();
+                await sendUploadChunk(session, 1);
+            } catch (e) {
+                if (session) {
+                    failUpload(session, "Upload failed: " + e.message);
+                } else {
+                    alertBox("Upload failed: " + e.message);
+                }
+            }
         }
 
         function pickFile(input) {
@@ -3793,16 +3984,17 @@
         var currentPath = "";
         var currentGroup = null;
         var download = [];
-        var upload = [];
+        var uploadSessions = Object.create(null);
         var fileMetadataByClearPath = [];
         var downloadContextByTransport = [];
-        var uploadDisplayNameByTransport = [];
-        var uploadUnixTimestampByTransport = [];
-        var chunkLength = [];
-        var chunkParts = [];
-        var chunkRequest = [];
         var setupQr = false;
-        var chunkSize = 1024 * 256; // The size of the chunks (blocks) for the file transfer. Set 0 to let the server decide the size of the chunks
+        var chunkSize = 1024 * 256; // Server -> browser download chunk size. Set 0 to let the server decide the size of the chunks
+        // 1 MB keeps a live disk-backed read plus base64/JSON transport preparation
+        // below the 100 ms long-task budget on the test machine. 4 MB produced
+        // 200-260 ms main-thread blocks. Every upload chunk costs one server
+        // round trip, so keep this value as large as the responsiveness budget allows.
+        var uploadChunkSize = 1 * 1024 * 1024; // Browser -> server upload chunk size
+        var encryptionSliceSize = 32 * 1024; // Yield to the browser between encryption slices
         var thumbnalSize = 80; // Parameter that is passed to the server and indicates the size of the larger side of the image preview
         var defaultProxyPort = 5050;
         var session = {

@@ -281,8 +281,9 @@ for (const withKey of [false, true]) {
         await requests(page, 4);
         await page.locator('.fileItemBox').nth(0).click();
         await requests(page, 5);
-        await page.evaluate(() => {
-            setFile('upload.txt', 1, new TextEncoder().encode('synthetic upload').buffer, null, 123);
+        await page.evaluate(async () => {
+            const bytes = new TextEncoder().encode('synthetic upload');
+            await startSendFile(new File([bytes], 'upload.txt', { lastModified: 123000 }), false);
             onGetFavorites();
             createDir('source', 'new-folder');
         });

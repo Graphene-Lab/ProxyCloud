@@ -1718,40 +1718,62 @@
             return deriveContentKey(virtualFullPath, unixLastWriteTimestamp >>> 0, state.contentMaster);
         }
 
+        function createCipherState(key) {
+            // Keep the evolving cipher state between chunks.  The ciphertext is a
+            // continuous stream: restarting this state for every chunk would make
+            // the result incompatible with the desktop client and the server.
+            let seal = blake2b512(key, 64);
+            return {
+                seal: seal,
+                current: blake2b512(seal, 64),
+                cycle: 0,
+                blockOffset: 0,
+                offset: 0,
+            };
+        }
+
+        function cryptChunkInto(input, state, output, outputOffset) {
+            let src = toByteArray(input);
+            outputOffset = outputOffset || 0;
+            if (output.byteLength - outputOffset < src.byteLength) {
+                throw new Error("Cipher output buffer is too small");
+            }
+            const blockSize = 8;
+            const cyclesPerHash = 8;
+            let current = state.current;
+            let cycle = state.cycle;
+            let blockOffset = state.blockOffset;
+            for (let i = 0; i < src.length; i++) {
+                output[outputOffset + i] = src[i] ^ current[cycle * blockSize + blockOffset];
+                blockOffset++;
+                if (blockOffset >= blockSize) {
+                    blockOffset = 0;
+                    cycle++;
+                    if (cycle >= cyclesPerHash) {
+                        // C#: Blake2b.ComputeHash(sealt, currentKey) => key=sealt, input=currentKey
+                        current = blake2b512(current, 64, state.seal);
+                        cycle = 0;
+                    }
+                }
+            }
+            state.current = current;
+            state.cycle = cycle;
+            state.blockOffset = blockOffset;
+            state.offset += src.length;
+            return output;
+        }
+
+        function cryptChunk(data, state) {
+            let src = toByteArray(data);
+            let output = new Uint8Array(src.length);
+            cryptChunkInto(src, state, output, 0);
+            return output.buffer;
+        }
+
         function cryptFileBytes(data, key) {
             let src = toByteArray(data);
             let output = new Uint8Array(src.length);
-            const blockSize = 8;
-            const cyclesPerHash = 8;
-            let seal = blake2b512(key, 64);
-            let current = blake2b512(seal, 64);
-            let cycle = 0;
-            let offset = 0;
-            let inputBuffer = new Uint8Array(blockSize);
-            let outputBuffer = new Uint8Array(blockSize);
-            while (offset < src.length) {
-                let bytesRead = src.length - offset;
-                if (bytesRead > blockSize) {
-                    bytesRead = blockSize;
-                }
-                let keyOffset = cycle * blockSize;
-                for (let i = 0; i < bytesRead; i++) {
-                    inputBuffer[i] = src[offset + i];
-                }
-                for (let i = 0; i < blockSize; i++) {
-                    outputBuffer[i] = inputBuffer[i] ^ current[keyOffset + i];
-                }
-                for (let i = 0; i < bytesRead; i++) {
-                    output[offset + i] = outputBuffer[i];
-                }
-                offset += bytesRead;
-                cycle++;
-                if (cycle >= cyclesPerHash) {
-                    // C#: Blake2b.ComputeHash(sealt, currentKey) => key=sealt, input=currentKey
-                    current = blake2b512(current, 64, seal);
-                    cycle = 0;
-                }
-            }
+            cryptChunkInto(src, createCipherState(key), output, 0);
             return output.buffer;
         }
 

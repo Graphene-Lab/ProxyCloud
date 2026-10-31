@@ -1500,9 +1500,20 @@
             console.log.apply(console, args);
         }
 
+        function updateZeroKnowledgeModeBadge() {
+            let badge = document.getElementById("zkModeBadge");
+            if (!badge) {
+                return;
+            }
+            let active = shouldUseZeroKnowledge();
+            badge.hidden = !active;
+            badge.innerText = active ? "\ud83d\udd12 Zero-knowledge encryption active" : "";
+        }
+
         function clearZeroKnowledgeCache() {
             zkCache.passphrase = null;
             zkCache.state = null;
+            updateZeroKnowledgeModeBadge();
         }
 
         function setZeroKnowledgePassphrase(passphrase) {
@@ -1516,6 +1527,7 @@
 
         async function initializeZeroKnowledgeState() {
             if (!shouldUseZeroKnowledge()) {
+                updateZeroKnowledgeModeBadge();
                 return;
             }
             let masterKey = toByteArray(await derivePrivateKeyFromPassphrase(zkPassphrase));
@@ -1527,6 +1539,7 @@
                 filenameObfuscationKey: filenameObfuscationKey,
                 contentMaster: contentMaster,
             };
+            updateZeroKnowledgeModeBadge();
             zkLog("Zero knowledge state created.", {
                 keyLen: masterKey.byteLength,
                 filenameKeyHash4: bufferToHex((await hash256(filenameObfuscationKey)).slice(0, 4)),
@@ -4019,6 +4032,7 @@
             if (checkbox) {
                 checkbox.checked = zeroKnowledgeEnabled;
             }
+            updateZeroKnowledgeModeBadge();
             goToTarget();
         });
         (async function initializeApp() {
@@ -4064,6 +4078,31 @@
         */
         progress {
             margin: 0px 10px 0px 10px;
+        }
+
+        .zkModeBadge {
+            display: inline-block;
+            margin: 0px 30px 8px 30px;
+            padding: 3px 9px;
+            border: 1px solid rgba(160, 220, 160, 0.65);
+            border-radius: 3px;
+            color: #d8ffd8;
+            background: rgba(40, 100, 40, 0.45);
+            font-size: small;
+        }
+
+        .zkModeBadge[hidden] {
+            display: none;
+        }
+
+        .cancelUpload {
+            margin: 0px 10px 0px 0px;
+            padding: 0px 6px;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+            background: transparent;
+            color: #fff;
+            cursor: pointer;
         }
 
         ::-webkit-scrollbar {
@@ -4297,6 +4336,7 @@
     <section class="container" ondrop="dropHandler(event);" onDragOver="event.preventDefault();">
         <section id="topBar" class="topBar">
             <div id="alertBox" class="alertBox"></div><br />
+            <div id="zkModeBadge" class="zkModeBadge" hidden></div>
             <fieldset>
                 <legend>Path</legend>
                 <div id="cloudPath" class="fileName"></div>

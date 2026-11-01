@@ -8,10 +8,12 @@ const {
 } = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 const { test, before, after } = require('node:test');
 const { chromium } = require('playwright');
 
-const html = readFileSync(path.join(__dirname, '..', 'CryptoCloudClientWeb.html'), 'utf8');
+const htmlPath = path.join(__dirname, '..', 'CryptoCloudClientWeb.html');
+const html = readFileSync(htmlPath, 'utf8');
 const ZK_PASSPHRASE = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 const FILE_TIMESTAMP = 1700000000;
 const FILE_TIMESTAMP_MS = FILE_TIMESTAMP * 1000;
@@ -27,7 +29,8 @@ before(async () => {
 });
 after(async () => { await browser?.close(); });
 
-async function openClient(t) {
+async function openClient(t, { localFile = false } = {}) {
+    const clientUrl = localFile ? pathToFileURL(htmlPath).href : 'https://web-client.test/';
     const context = await browser.newContext({ viewport: { width: 1600, height: 1000 }, serviceWorkers: 'block' });
     const page = await context.newPage();
     page.setDefaultTimeout(60000);
@@ -36,8 +39,8 @@ async function openClient(t) {
     const unexpectedNetwork = [];
     page.on('pageerror', error => errors.push(error.message));
     await context.route('**/*', route => {
-        if (route.request().isNavigationRequest() && route.request().url() === 'https://web-client.test/') {
-            return route.fulfill({ contentType: 'text/html', body: html });
+        if (route.request().isNavigationRequest() && route.request().url() === clientUrl) {
+            return localFile ? route.continue() : route.fulfill({ contentType: 'text/html', body: html });
         }
         unexpectedNetwork.push(route.request().url());
         return route.abort();
@@ -193,7 +196,7 @@ async function openClient(t) {
             await context.close();
         }
     });
-    await page.goto('https://web-client.test/');
+    await page.goto(clientUrl);
     await page.waitForFunction(() => session.clientId != null);
     await page.evaluate(() => {
         session.deviceKey = 'test-only-transport-key';
@@ -270,24 +273,72 @@ async function dropSpec(page, spec) {
             };
         }
 
+        function buildHandle(node) {
+            if (node.type === 'file') {
+                return {
+                    kind: 'file',
+                    name: node.name,
+                    async getFile() {
+                        return new File([Uint8Array.from(node.bytes || [])], node.name,
+                            { lastModified: node.lastModified || 1700000000000 });
+                    },
+                };
+            }
+            return {
+                kind: 'directory',
+                name: node.name,
+                async *values() {
+                    for (const child of node.children || []) {
+                        yield buildHandle(child);
+                    }
+                },
+            };
+        }
+
+        let handlingDrop = true;
+        window.testLegacyDropReads = 0;
+        window.testDropHandleCaptures = [];
         const dataTransfer = {
             items: spec.roots.map(root => {
                 const entry = buildEntry(root);
+                if (spec.legacyReadError && entry.isDirectory) {
+                    entry.createReader = () => ({
+                        readEntries(success, error) {
+                            window.testLegacyDropReads++;
+                            error(new DOMException('Malformed filesystem URI', 'EncodingError'));
+                        },
+                    });
+                }
                 return {
                     kind: 'file',
-                    webkitGetAsEntry: () => entry,
-                    getAsFile: () => null,
+                    webkitGetAsEntry: () => spec.noLegacyEntries ? null : entry,
+                    getAsFile: () => spec.useHandles ? new File([], root.name) : null,
+                    ...(spec.useHandles ? {
+                        getAsFileSystemHandle() {
+                            window.testDropHandleCaptures.push({ name: root.name, handlingDrop });
+                            if (!handlingDrop) return Promise.resolve(null);
+                            if (spec.handleError) return Promise.reject(new Error('Handles unavailable'));
+                            if (spec.nullHandles) return Promise.resolve(null);
+                            return Promise.resolve(buildHandle(root));
+                        },
+                    } : {}),
                 };
             }),
             files: [],
         };
-        return dropHandler({ preventDefault() {}, stopPropagation() {}, dataTransfer });
+        const result = dropHandler({ preventDefault() {}, stopPropagation() {}, dataTransfer });
+        handlingDrop = false;
+        return result;
     }, spec);
 }
 
-function makeTree(t, structure) {
-    const base = mkdtempSync(path.join(os.tmpdir(), 'cloud-folder-upload-'));
-    t.after(() => rmSync(base, { recursive: true, force: true }));
+function makeTree(t, structure, fixtureRoot = os.tmpdir()) {
+    fixtureRoot = path.resolve(fixtureRoot);
+    const base = mkdtempSync(path.join(fixtureRoot, 'cloud-folder-upload-'));
+    t.after(() => {
+        assert.equal(path.dirname(base), fixtureRoot);
+        rmSync(base, { recursive: true, force: true });
+    });
 
     function writeNode(node, relativePath) {
         const fullPath = path.join(base, relativePath);
@@ -506,6 +557,205 @@ test('drops fall back to dataTransfer.files when entries are unavailable', async
     assert.deepEqual(state.setFiles, ['fallback/fallback.txt']);
     assert.equal(state.bars, 0);
 });
+
+test('top-level file drops use getAsFile when entry.file fails', async t => {
+    const page = await openClient(t);
+    await page.evaluate(() => {
+        currentPath = 'readerbase';
+    });
+    await resetCounters(page);
+
+    await page.evaluate(async () => {
+        window.testEntryFileCalled = false;
+        const file = new File(
+            [new Uint8Array([1, 2, 3])],
+            '1782805900123.pdf',
+            { lastModified: 1700000000000 }
+        );
+        const entry = {
+            isFile: true,
+            isDirectory: false,
+            name: '1782805900123.pdf',
+            file(success, error) {
+                window.testEntryFileCalled = true;
+                error(new DOMException('synthetic EncodingError', 'EncodingError'));
+            },
+        };
+        const dataTransfer = {
+            items: [{ kind: 'file', webkitGetAsEntry: () => entry, getAsFile: () => file }],
+            files: [file],
+        };
+        await dropHandler({ preventDefault() {}, stopPropagation() {}, dataTransfer });
+    });
+    await waitForBatch(page, 1, 0);
+
+    const state = await page.evaluate(() => ({
+        setFiles: window.testSetFileRequests.map(request => request.fullName),
+        entryFileCalled: window.testEntryFileCalled,
+        alert: document.getElementById('alertBox').innerText,
+    }));
+    assert.deepEqual(state.setFiles, ['readerbase/1782805900123.pdf']);
+    assert.equal(state.entryFileCalled, false);
+    assert.equal(state.alert, '');
+});
+
+test('unreadable dropped directories are reported without creating empty folders', async t => {
+    const page = await openClient(t);
+    await page.evaluate(() => {
+        currentPath = 'readfail';
+    });
+    await resetCounters(page);
+
+    await page.evaluate(async () => {
+        const entry = {
+            isFile: false,
+            isDirectory: true,
+            name: 'UnreadableRoot',
+            createReader() {
+                return {
+                    readEntries(success, error) {
+                        error(new DOMException('synthetic EncodingError', 'EncodingError'));
+                    },
+                };
+            },
+        };
+        const dataTransfer = {
+            items: [{ kind: 'file', webkitGetAsEntry: () => entry, getAsFile: () => null }],
+            files: [],
+        };
+        await dropHandler({ preventDefault() {}, stopPropagation() {}, dataTransfer });
+    });
+
+    const state = await page.evaluate(() => ({
+        createDirs: window.testCreateDirRequests.length,
+        setFiles: window.testSetFileRequests.length,
+        alert: document.getElementById('alertBox').innerText,
+        running: uploadBatchRunning,
+    }));
+    assert.equal(state.createDirs, 0);
+    assert.equal(state.setFiles, 0);
+    assert.match(state.alert, /Could not read 1 dropped item/i);
+    assert.match(state.alert, /Upload buttons/i);
+    assert.equal(state.running, false);
+});
+
+test('native folder drops from a local HTML file upload actual files and empty folders', async t => {
+    const page = await openClient(t, { localFile: true });
+    await page.evaluate(() => { currentPath = 'native'; });
+    await resetCounters(page);
+    // Chromium restricts directory handles under AppData (including os.tmpdir()).
+    // Keep this synthetic native-drop fixture in the test directory instead.
+    const folder = makeTree(t, { roots: [{
+        type: 'dir', name: 'samplePdf', children: [
+            { type: 'file', name: 'report #100% ə.pdf', bytes: [1, 2, 3] },
+            { type: 'dir', name: 'nested', children: [
+                { type: 'file', name: 'empty.txt', bytes: [] },
+            ] },
+            { type: 'dir', name: 'empty', children: [] },
+        ],
+    }] }, __dirname);
+    const target = await page.locator('#topBar').boundingBox();
+    assert.ok(target, 'The upload drop area is visible');
+    const cdp = await page.context().newCDPSession(page);
+    for (const type of ['dragEnter', 'dragOver', 'drop']) {
+        await cdp.send('Input.dispatchDragEvent', {
+            type,
+            x: target.x + target.width / 2,
+            y: target.y + target.height / 2,
+            data: { items: [], files: [folder], dragOperationsMask: 1 },
+        });
+    }
+    await waitForBatch(page, 2, 2);
+    const state = await page.evaluate(() => ({
+        protocol: location.protocol,
+        directories: window.testCreateDirRequests.map(r => r.payload),
+        uploads: window.testSetFileRequests.map(r => ({
+            path: r.fullName, bytes: Array.from(new Uint8Array(base64ToBuffer(r.data))),
+        })).sort((a, b) => a.path.localeCompare(b.path)),
+        alert: document.getElementById('alertBox').innerText,
+    }));
+    assert.equal(state.protocol, 'file:');
+    assert.deepEqual(state.directories, [
+        'native\tsamplePdf', 'native/samplePdf\tempty\tnested',
+    ]);
+    assert.deepEqual(state.uploads, [
+        { path: 'native/samplePdf/nested/empty.txt', bytes: [] },
+        { path: 'native/samplePdf/report #100% ə.pdf', bytes: [1, 2, 3] },
+    ]);
+    assert.equal(state.alert, '');
+});
+
+for (const noLegacyEntries of [false, true]) {
+    test(`folder handles upload nested files when legacy entries are ${noLegacyEntries ? 'missing' : 'unreadable'}`, async t => {
+        const page = await openClient(t);
+        await page.evaluate(() => { currentPath = 'handles'; });
+        await resetCounters(page);
+
+        await dropSpec(page, {
+            useHandles: true,
+            legacyReadError: true,
+            noLegacyEntries,
+            roots: [{
+                type: 'dir', name: 'samplePdf', children: [
+                    { type: 'file', name: 'report #100% ə.pdf', bytes: [1, 2, 3] },
+                    { type: 'dir', name: 'nested', children: [
+                        { type: 'file', name: 'empty.txt', bytes: [] },
+                    ] },
+                    { type: 'dir', name: 'empty', children: [] },
+                ],
+            }, {
+                type: 'dir', name: 'second', children: [
+                    { type: 'file', name: 'second.txt', bytes: [4] },
+                ],
+            }],
+        });
+        const state = await page.evaluate(() => ({
+            files: uploadSummaryState.jobs.map(job => job.relativePath).sort(),
+            legacyReads: window.testLegacyDropReads,
+            captures: window.testDropHandleCaptures,
+            alert: document.getElementById('alertBox').innerText,
+        }));
+        assert.deepEqual(state.files, [
+            'samplePdf/nested/empty.txt', 'samplePdf/report #100% ə.pdf', 'second/second.txt',
+        ]);
+        assert.equal(state.legacyReads, 0);
+        assert.deepEqual(state.captures, [
+            { name: 'samplePdf', handlingDrop: true }, { name: 'second', handlingDrop: true },
+        ]);
+        assert.equal(state.alert, '');
+        await waitForBatch(page, 3, 2);
+        assert.deepEqual(await page.evaluate(() => window.testCreateDirRequests.map(r => r.payload)), [
+            'handles\tsamplePdf\tsecond', 'handles/samplePdf\tempty\tnested',
+        ]);
+        const uploads = await page.evaluate(() => window.testSetFileRequests.map(r => ({
+            path: r.fullName, bytes: Array.from(new Uint8Array(base64ToBuffer(r.data))),
+        })).sort((a, b) => a.path.localeCompare(b.path)));
+        assert.deepEqual(uploads, [
+            { path: 'handles/samplePdf/nested/empty.txt', bytes: [] },
+            { path: 'handles/samplePdf/report #100% ə.pdf', bytes: [1, 2, 3] },
+            { path: 'handles/second/second.txt', bytes: [4] },
+        ]);
+    });
+}
+
+for (const failure of ['handleError', 'nullHandles']) {
+    test(`folder drops use legacy traversal when handle acquisition returns ${failure}`, async t => {
+        const page = await openClient(t);
+        await page.evaluate(() => { currentPath = 'legacy'; });
+        await resetCounters(page);
+        await dropSpec(page, {
+            useHandles: true,
+            [failure]: true,
+            roots: [{ type: 'dir', name: 'Root', children: [
+                { type: 'file', name: 'one.txt', bytes: [9] },
+            ] }],
+        });
+        await waitForBatch(page, 1, 1);
+        assert.deepEqual(await page.evaluate(() => window.testSetFileRequests.map(r => r.fullName)),
+            ['legacy/Root/one.txt']);
+        assert.equal(await page.locator('#alertBox').innerText(), '');
+    });
+}
 
 test('empty files upload one zero-byte chunk', async t => {
     const page = await openClient(t);

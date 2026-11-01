@@ -3609,30 +3609,52 @@
             if (!entry) {
                 return;
             }
+            batch.errors = batch.errors || [];
             relativePath = normalizeRelativeUnixPath(relativePath);
             if (!relativePath) {
                 return;
             }
-            if (entry.isFile) {
+            if (entry.isFile || entry.kind === "file") {
                 try {
-                    let file = await readDroppedFile(entry);
+                    let file = entry.kind === "file"
+                        ? await entry.getFile()
+                        : await readDroppedFile(entry);
                     if (file) {
                         batch.files.push({ file: file, relativePath: relativePath });
                     }
                 } catch (error) {
-                    console.warn("Could not read a dropped file.", error);
+                    console.warn("Could not read a dropped file.", relativePath, error);
+                    batch.errors.push({
+                        path: relativePath,
+                        name: error && error.name,
+                        message: error && error.message ? error.message : String(error),
+                    });
                 }
                 return;
             }
-            if (entry.isDirectory) {
-                batch.directories.push(relativePath);
+            if (entry.isDirectory || entry.kind === "directory") {
                 let children;
                 try {
-                    children = await readAllDirectoryEntries(entry.createReader());
+                    if (entry.kind === "directory") {
+                        children = [];
+                        for await (let child of entry.values()) {
+                            children.push(child);
+                        }
+                    } else {
+                        children = await readAllDirectoryEntries(entry.createReader());
+                    }
                 } catch (error) {
-                    console.warn("Could not read a dropped directory.", error);
+                    console.warn("Could not read a dropped directory.", relativePath, error);
+                    batch.errors.push({
+                        path: relativePath,
+                        name: error && error.name,
+                        message: error && error.message ? error.message : String(error),
+                    });
                     return;
                 }
+                // Only create the directory after its contents were read
+                // successfully. A failed read should not leave an empty folder.
+                batch.directories.push(relativePath);
                 for (let i = 0; i < children.length; i++) {
                     let child = children[i];
                     if (!child || !child.name) {
@@ -3660,10 +3682,6 @@
                     } catch (error) {
                         entry = null;
                     }
-                    if (entry) {
-                        snapshot.entries.push(entry);
-                        continue;
-                    }
                     let file = null;
                     try {
                         if (typeof item.getAsFile === "function") {
@@ -3671,6 +3689,29 @@
                         }
                     } catch (error) {
                         file = null;
+                    }
+                    if (entry && entry.isFile && file) {
+                        // Prefer the File already supplied by the drop event.
+                        snapshot.files.push({
+                            file: file,
+                            relativePath: normalizeRelativeUnixPath(entry.name || file.name),
+                        });
+                        continue;
+                    }
+                    let handlePromise = null;
+                    try {
+                        if (typeof item.getAsFileSystemHandle === "function") {
+                            // Start every handle request during the drop event,
+                            // before any await makes its data store inaccessible.
+                            handlePromise = Promise.resolve(item.getAsFileSystemHandle())
+                                .catch(function () { return null; });
+                        }
+                    } catch (error) {
+                        handlePromise = null;
+                    }
+                    if (entry || handlePromise) {
+                        snapshot.entries.push({ entry: entry, handlePromise: handlePromise, file: file });
+                        continue;
                     }
                     if (file) {
                         snapshot.files.push({
@@ -4119,22 +4160,45 @@
             }
 
             // DataTransfer items are only valid while the event is being handled,
-            // so snapshot entries before the first await.
+            // so snapshot entries and start handle requests before the first await.
             let snapshot = snapshotDroppedItems(ev.dataTransfer);
             let batch = {
                 basePath: currentPath,
                 files: snapshot.files.slice(),
                 directories: [],
+                errors: [],
             };
             for (let i = 0; i < snapshot.entries.length; i++) {
-                let entry = snapshot.entries[i];
-                await walkDroppedEntry(entry, entry ? entry.name : "", batch);
+                let item = snapshot.entries[i];
+                let handle = item.handlePromise ? await item.handlePromise : null;
+                let entry = handle || item.entry;
+                if (entry) {
+                    await walkDroppedEntry(entry, entry.name, batch);
+                } else if (item.file) {
+                    batch.files.push({
+                        file: item.file,
+                        relativePath: normalizeRelativeUnixPath(item.file.webkitRelativePath || item.file.name),
+                    });
+                } else {
+                    snapshot.skipped++;
+                }
+            }
+            if (batch.errors.length > 0) {
+                let first = batch.errors[0];
+                let remaining = batch.errors.length > 1
+                    ? " (" + (batch.errors.length - 1) + " more)"
+                    : "";
+                let hint = first.name === "EncodingError" || /EncodingError/i.test(first.message)
+                    ? " The browser could not read the dropped items. Try the Upload buttons, or open the page directly in a browser if you are using an embedded preview."
+                    : "";
+                alertBox("Could not read " + batch.errors.length + " dropped item(s)" +
+                    remaining + ": " + first.path + " \u2014 " + first.message + hint);
             }
             if (snapshot.skipped > 0) {
                 alertBox("Some dropped items could not be read. Use the Upload folder button if folder drag-and-drop is unavailable in this browser.");
             }
             if (batch.files.length === 0 && batch.directories.length === 0) {
-                if (snapshot.skipped === 0) {
+                if (snapshot.skipped === 0 && batch.errors.length === 0) {
                     alertBox("No files or folders were found in the drop.");
                 }
                 return;
